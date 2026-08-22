@@ -1,0 +1,5 @@
+CONFIG_IDF_TARGET="esp32s3"
+
+# ring_node/gateway_uplink logging plus lwIP socket calls need a bit more
+# headroom than the 3.5K default main-task stack.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192

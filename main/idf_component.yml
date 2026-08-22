@@ -1,0 +1,4 @@
+dependencies:
+  espressif/enc28j60: "^1.1.0"
+  idf:
+    version: ">=5.0"
