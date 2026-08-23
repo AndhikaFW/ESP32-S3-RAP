@@ -7,10 +7,15 @@
 #include "esp_eth.h"
 #include "esp_eth_enc28j60.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
@@ -27,6 +32,92 @@ esp_eth_handle_t g_ethHandle = nullptr;
 esp_netif_t *g_netif = nullptr;
 volatile bool g_linkUp = false;
 
+// One video frame queued for the Ethernet uplink; owns `data` until it's
+// either sent or dropped (see freeVideoItem()).
+struct VideoItem {
+  uint8_t origin_node_id;
+  uint8_t stream_id;
+  uint16_t seq;
+  uint32_t data_len;
+  uint8_t *data;
+};
+
+struct __attribute__((packed)) VideoFrameHeader {
+  uint8_t origin_node_id;
+  uint8_t stream_id;  // which of this node's kVideoStreamsPerNode cameras
+  uint16_t seq;
+  uint32_t data_len;
+};
+
+QueueHandle_t g_videoQueue = nullptr;
+
+void freeVideoItem(VideoItem *item) {
+  if (item == nullptr) return;
+  if (item->data != nullptr) heap_caps_free(item->data);
+  delete item;
+}
+
+bool sendAllTcp(int sock, const void *buf, size_t len) {
+  const uint8_t *p = static_cast<const uint8_t *>(buf);
+  size_t sent = 0;
+  while (sent < len) {
+    ssize_t n = send(sock, p + sent, len - sent, 0);
+    if (n <= 0) return false;
+    sent += static_cast<size_t>(n);
+  }
+  return true;
+}
+
+// Drains g_videoQueue over a persistent TCP connection to the backend --
+// unlike flush()'s per-reading connect/send/close, video arrives far more
+// often, so paying a fresh handshake per frame would waste a meaningful
+// slice of the ENC28J60's 10Mbps budget. Reconnects on failure/link-down.
+void videoUplinkTask(void * /*arg*/) {
+  while (true) {
+    if (!g_linkUp) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0) {
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+    sockaddr_in dest{};
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(kVideoBackendPort);
+    inet_pton(AF_INET, kBackendHost, &dest.sin_addr);
+
+    timeval tv{};
+    tv.tv_sec = 2;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    if (connect(sock, reinterpret_cast<sockaddr *>(&dest), sizeof(dest)) != 0) {
+      ESP_LOGW(kTag, "video uplink connect to %s:%u failed", kBackendHost, kVideoBackendPort);
+      close(sock);
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+    ESP_LOGI(kTag, "video uplink connected to %s:%u", kBackendHost, kVideoBackendPort);
+
+    bool linkOk = true;
+    while (linkOk) {
+      VideoItem *item = nullptr;
+      if (xQueueReceive(g_videoQueue, &item, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        continue;  // nothing to send right now, keep the connection warm
+      }
+      VideoFrameHeader hdr{item->origin_node_id, item->stream_id, item->seq, item->data_len};
+      linkOk = sendAllTcp(sock, &hdr, sizeof(hdr)) && sendAllTcp(sock, item->data, item->data_len);
+      freeVideoItem(item);
+    }
+
+    close(sock);
+    ESP_LOGW(kTag, "video uplink connection lost, retrying");
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
 void ethEventHandler(void *, esp_event_base_t, int32_t eventId, void *eventData) {
   auto handle = *static_cast<esp_eth_handle_t *>(eventData);
   uint8_t mac[6] = {0};
@@ -34,8 +125,8 @@ void ethEventHandler(void *, esp_event_base_t, int32_t eventId, void *eventData)
     case ETHERNET_EVENT_CONNECTED:
       g_linkUp = true;
       esp_eth_ioctl(handle, ETH_CMD_G_MAC_ADDR, mac);
-      ESP_LOGI(kTag, "link up, MAC=%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3],
-               mac[4], mac[5]);
+      ESP_LOGI(kTag, "link up, MAC=%02x:%02x:%02x:%02x:%02x:%02x, static ip=%s", mac[0], mac[1],
+               mac[2], mac[3], mac[4], mac[5], kEthStaticIp);
       break;
     case ETHERNET_EVENT_DISCONNECTED:
       g_linkUp = false;
@@ -46,14 +137,15 @@ void ethEventHandler(void *, esp_event_base_t, int32_t eventId, void *eventData)
   }
 }
 
-void gotIpEventHandler(void *, esp_event_base_t, int32_t, void *eventData) {
-  auto *event = static_cast<ip_event_got_ip_t *>(eventData);
-  ESP_LOGI(kTag, "got ip: " IPSTR, IP2STR(&event->ip_info.ip));
-}
-
 }  // namespace
 
 bool init() {
+  // Created unconditionally, before anything ENC28J60-specific that can
+  // fail below: flushVideo() must stay safe to call (it just drops frames
+  // while g_linkUp is false) even if the Ethernet driver never comes up.
+  g_videoQueue = xQueueCreate(kVideoUplinkQueueDepth, sizeof(VideoItem *));
+  xTaskCreate(videoUplinkTask, "video_uplink", 4096, nullptr, 4, nullptr);
+
   // Shared ISR service the enc28j60 driver needs for its interrupt GPIO;
   // ESP_ERR_INVALID_STATE just means something else already installed it.
   esp_err_t isrErr = gpio_install_isr_service(0);
@@ -130,8 +222,17 @@ bool init() {
     return false;
   }
 
+  // Static IP: this is a direct cable to RPi4's eth0, no DHCP server on the
+  // link (see config.h kEthStatic*). ESP_NETIF_DEFAULT_ETH() starts with a
+  // DHCP client enabled, so that has to be stopped before assigning one.
+  esp_netif_dhcpc_stop(g_netif);
+  esp_netif_ip_info_t ipInfo{};
+  ipInfo.ip.addr = ipaddr_addr(kEthStaticIp);
+  ipInfo.gw.addr = ipaddr_addr(kEthStaticGateway);
+  ipInfo.netmask.addr = ipaddr_addr(kEthStaticNetmask);
+  esp_netif_set_ip_info(g_netif, &ipInfo);
+
   esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &ethEventHandler, nullptr);
-  esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &gotIpEventHandler, nullptr);
 
   if (esp_eth_start(g_ethHandle) != ESP_OK) {
     ESP_LOGE(kTag, "esp_eth_start failed");
@@ -140,15 +241,15 @@ bool init() {
   return true;
 }
 
-void flush(const TokenEntry *entries, uint8_t count, uint16_t cycleId) {
+void flush(uint8_t nodeId, uint8_t occupied, const char *plate) {
   if (!g_linkUp) {
-    ESP_LOGW(kTag, "link down, dropping lap %u", cycleId);
+    ESP_LOGW(kTag, "link down, dropping reading from node %u", nodeId);
     return;
   }
 
   int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (sock < 0) {
-    ESP_LOGW(kTag, "socket() failed, dropping lap %u", cycleId);
+    ESP_LOGW(kTag, "socket() failed, dropping reading from node %u", nodeId);
     return;
   }
 
@@ -157,7 +258,7 @@ void flush(const TokenEntry *entries, uint8_t count, uint16_t cycleId) {
   dest.sin_port = htons(kBackendPort);
   inet_pton(AF_INET, kBackendHost, &dest.sin_addr);
 
-  // 2s connect/send budget so a dead backend never stalls the ring.
+  // 2s connect/send budget so a dead backend never stalls the chain.
   timeval tv{};
   tv.tv_sec = 2;
   tv.tv_usec = 0;
@@ -165,26 +266,37 @@ void flush(const TokenEntry *entries, uint8_t count, uint16_t cycleId) {
   setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
   if (connect(sock, reinterpret_cast<sockaddr *>(&dest), sizeof(dest)) != 0) {
-    ESP_LOGW(kTag, "connect to %s:%u failed, dropping lap %u", kBackendHost, kBackendPort, cycleId);
+    ESP_LOGW(kTag, "connect to %s:%u failed, dropping reading from node %u", kBackendHost, kBackendPort,
+              nodeId);
     close(sock);
     return;
   }
 
-  // Compact line-oriented payload: "cycle,count;node:value,node:value,...\n"
-  // Swap this for whatever framing the ParkingVision backend expects once
-  // that API is defined.
-  char line[16 + kMaxRingNodes * 8];
-  int written = snprintf(line, sizeof(line), "%u,%u;", cycleId, count);
-  for (uint8_t i = 0; i < count && written < static_cast<int>(sizeof(line)); ++i) {
-    written += snprintf(line + written, sizeof(line) - written, "%u:%u%s", entries[i].node_id,
-                         entries[i].value, (i + 1 < count) ? "," : "");
-  }
+  // Compact line-oriented payload: "node:occupied:plate\n" -- one line per
+  // reading, sent as soon as it arrives (no more batching by lap). Swap this
+  // for whatever framing the ParkingVision backend expects once that API is
+  // defined -- video/plate-crop images never flow through here, only this
+  // small per-node text summary.
+  char line[16 + kMaxPlateLen];
+  int written = snprintf(line, sizeof(line), "%u:%u:%s", nodeId, occupied, plate);
   if (written < static_cast<int>(sizeof(line))) {
     line[written++] = '\n';
   }
 
   send(sock, line, written, 0);
   close(sock);
+}
+
+void flushVideo(uint8_t originNodeId, uint8_t streamId, uint16_t seq, uint8_t *data, uint32_t dataLen) {
+  if (g_videoQueue == nullptr || !g_linkUp) {
+    heap_caps_free(data);
+    return;
+  }
+  auto *item = new VideoItem{originNodeId, streamId, seq, dataLen, data};
+  if (xQueueSend(g_videoQueue, &item, 0) != pdTRUE) {
+    ESP_LOGW(kTag, "video uplink queue full, dropping node=%u stream=%u", originNodeId, streamId);
+    freeVideoItem(item);
+  }
 }
 
 }  // namespace gateway_uplink

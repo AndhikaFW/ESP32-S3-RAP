@@ -3,3 +3,21 @@ CONFIG_IDF_TARGET="esp32s3"
 # ring_node/gateway_uplink logging plus lwIP socket calls need a bit more
 # headroom than the 3.5K default main-task stack.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Board has 8MB octal PSRAM (confirmed via esptool chip-id: "Embedded PSRAM
+# 8MB"); video_relay uses it to buffer frames so capture/relay rates don't
+# have to be tightly lockstepped.
+#
+# 40MHz, not 80MHz: one of our two test units reproducibly fails the PSRAM
+# power-on self-test at 80MHz (crashes with a double exception before
+# app_main even starts, every boot) but passes cleanly at 40MHz -- a marginal
+# PSRAM/power-delivery timing margin issue on that specific board, not a
+# code bug. Revisit per-unit once real enclosures/wiring are final.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_40M=y
+
+# video_relay opens several concurrent TCP sockets (server + client, per
+# node) alongside the existing gateway_uplink socket; bump lwIP's default
+# socket ceiling so we don't silently run out.
+CONFIG_LWIP_MAX_SOCKETS=16

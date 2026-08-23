@@ -1,0 +1,8 @@
+# Defaults overlay for boards whose physical PSRAM chip is defective/absent
+# (see docs/network/topology.md and the PSRAM bring-up notes in git history).
+# Build with:
+#   idf.py -B build_nopsram -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.nopsram.defaults" build
+# idf.py merges defaults files left-to-right, so this only needs to override
+# what actually changes -- CONFIG_SPIRAM=n also makes the OCT/speed settings
+# in sdkconfig.defaults moot (their Kconfig entries depend on SPIRAM being on).
+CONFIG_SPIRAM=n

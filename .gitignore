@@ -1,4 +1,5 @@
 build/
+build_nopsram/
 managed_components/
 dependencies.lock
 sdkconfig

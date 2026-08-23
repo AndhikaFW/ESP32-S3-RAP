@@ -54,10 +54,14 @@ bool init() {
   // skipping NVS storage here avoids fighting our own provisioning writes.
   esp_wifi_set_storage(WIFI_STORAGE_RAM);
 
-  if (esp_wifi_set_mode(WIFI_MODE_STA) != ESP_OK || esp_wifi_start() != ESP_OK) {
+  // APSTA (not plain STA): video_relay.cpp also needs this node's own SoftAP
+  // (for its ring "prev" to connect to) and a STA link into its "next"
+  // neighbor's AP, on this exact same channel -- see config.h kEspNowChannel.
+  if (esp_wifi_set_mode(WIFI_MODE_APSTA) != ESP_OK || esp_wifi_start() != ESP_OK) {
     return false;
   }
-  // No AP to negotiate a channel with, so every ring node fixes the same one.
+  // No AP to negotiate a channel with for ESP-NOW itself, so every chain
+  // node fixes the same one; video_relay's SoftAP configs also pin this channel.
   esp_wifi_set_channel(kEspNowChannel, WIFI_SECOND_CHAN_NONE);
 
   if (esp_now_init() != ESP_OK) {

@@ -1,0 +1,65 @@
+digraph EncWiring {
+    rankdir=LR;
+    bgcolor="white";
+    fontname="Helvetica";
+    node [fontname="Helvetica", fontsize=11];
+    edge [fontname="Helvetica", fontsize=10];
+
+    labelloc="t";
+    label="Wiring ENC28J60 <-> ESP32-S3 Gateway <-> RPi4 (eth0, IP statis)";
+    fontsize=15;
+
+    subgraph cluster_enc {
+        label="Modul ENC28J60";
+        style="rounded,filled";
+        fillcolor="#fff5f5";
+        color="#c53030";
+        node [shape=box, style="rounded,filled", fillcolor="#fed7d7", color="#9b2c2c"];
+        ENC_CS   [label="CS"];
+        ENC_SCK  [label="SCK"];
+        ENC_MOSI [label="SI (MOSI)"];
+        ENC_MISO [label="SO (MISO)"];
+        ENC_INT  [label="INT"];
+        ENC_RST  [label="RST"];
+        ENC_VCC  [label="VCC (3.3V)"];
+        ENC_GND  [label="GND"];
+        ENC_RJ45 [label="RJ45", shape=box, style="rounded,filled", fillcolor="#feb2b2", color="#822727"];
+    }
+
+    subgraph cluster_esp {
+        label="ESP32-S3 (Gateway, node_id=0) -- SPI2_HOST, 8MHz";
+        style="rounded,filled";
+        fillcolor="#ebf8ff";
+        color="#2b6cb0";
+        node [shape=box, style="rounded,filled", fillcolor="#bee3f8", color="#2c5282"];
+        ESP_CS   [label="GPIO10 (kEncCsPin)"];
+        ESP_SCK  [label="GPIO12 (kEncSckPin)"];
+        ESP_MOSI [label="GPIO11 (kEncMosiPin)"];
+        ESP_MISO [label="GPIO13 (kEncMisoPin)"];
+        ESP_INT  [label="GPIO9 (kEncIntPin)"];
+        ESP_3V3  [label="3V3"];
+        ESP_GND  [label="GND"];
+    }
+
+    subgraph cluster_rpi {
+        label="Raspberry Pi 4";
+        style="rounded,filled";
+        fillcolor="#f0fff4";
+        color="#2f855a";
+        RPI_ETH0 [label="eth0\nIP statis 192.168.50.1/24\n(nmcli \"Wired connection 1\")", shape=box, style="rounded,filled", fillcolor="#c6f6d5", color="#22543d"];
+    }
+
+    ESP_CS -> ENC_CS [color="#805ad5", penwidth=1.5];
+    ESP_SCK -> ENC_SCK [color="#805ad5", penwidth=1.5];
+    ESP_MOSI -> ENC_MOSI [label="  data", color="#2b6cb0", penwidth=2];
+    ENC_MISO -> ESP_MISO [label="  data", color="#c53030", penwidth=2, dir=back];
+    ENC_INT -> ESP_INT [label="  interrupt", color="#dd6b20", penwidth=1.5];
+    ESP_3V3 -> ENC_VCC [color="#38a169", style=dashed];
+    ESP_GND -> ENC_GND [dir=none, style=dashed, color="#4a5568"];
+    ENC_RST -> ESP_3V3 [label="  (tie high / not used,\n  kEncPhyReset=-1)", style=dotted, color="#a0aec0", dir=none];
+
+    ENC_RJ45 -> RPI_ETH0 [label="  kabel RJ45 langsung\n  (auto-MDIX, straight-through OK)", color="#c05621", penwidth=2.5, style=bold];
+
+    NOTE [shape=note, style=filled, fillcolor="#fefcbf", color="#b7791f", fontsize=10,
+          label="Link langsung (bukan lewat switch/router) -> tidak ada DHCP server,\nkarena itu KEDUA sisi pakai IP statis: ESP32-S3=192.168.50.2, RPi4 eth0=192.168.50.1.\nJANGAN sambung VBUS/5V ke ENC28J60 -- pakai 3.3V (VCC), ENC28J60 makan arus cukup besar (~180mA),\npastikan sumber 3.3V ESP32-S3 sanggup, kalau tidak stabil pakai regulator 3.3V terpisah."];
+}

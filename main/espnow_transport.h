@@ -5,7 +5,7 @@
 
 // Thin wrapper around ESP-NOW: WiFi/esp_now bring-up, peer bookkeeping, and
 // a queue that moves received packets out of the WiFi task and into the
-// ring_node polling loop.
+// chain_node polling loop.
 namespace espnow {
 
 using RecvHandler = void (*)(const uint8_t mac[6], const uint8_t *data, size_t len);
@@ -23,8 +23,8 @@ bool addPeer(const uint8_t mac[6]);
 bool removePeer(const uint8_t mac[6]);
 
 // Unicast / broadcast send. Both are fire-and-forget at this layer; delivery
-// confidence comes from the application-level ACK in the ring protocol, not
-// from ESP-NOW's own send callback.
+// confidence comes from the application-level ACK in the chain protocol
+// (chain_node.cpp), not from ESP-NOW's own send callback.
 bool send(const uint8_t mac[6], const uint8_t *data, size_t len);
 bool sendBroadcast(const uint8_t *data, size_t len);
 
