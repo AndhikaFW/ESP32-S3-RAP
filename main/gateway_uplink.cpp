@@ -248,15 +248,15 @@ bool init() {
   return true;
 }
 
-void flush(uint8_t nodeId, uint8_t occupied, const char *plate) {
+void flush(uint8_t nodeId, uint8_t streamId, uint8_t occupied, const char *plate) {
   if (!g_linkUp) {
-    ESP_LOGW(kTag, "link down, dropping reading from node %u", nodeId);
+    ESP_LOGW(kTag, "link down, dropping reading from node %u stream %u", nodeId, streamId);
     return;
   }
 
   int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (sock < 0) {
-    ESP_LOGW(kTag, "socket() failed, dropping reading from node %u", nodeId);
+    ESP_LOGW(kTag, "socket() failed, dropping reading from node %u stream %u", nodeId, streamId);
     return;
   }
 
@@ -273,19 +273,19 @@ void flush(uint8_t nodeId, uint8_t occupied, const char *plate) {
   setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
   if (connect(sock, reinterpret_cast<sockaddr *>(&dest), sizeof(dest)) != 0) {
-    ESP_LOGW(kTag, "connect to %s:%u failed, dropping reading from node %u", kBackendHost, kBackendPort,
-              nodeId);
+    ESP_LOGW(kTag, "connect to %s:%u failed, dropping reading from node %u stream %u", kBackendHost,
+              kBackendPort, nodeId, streamId);
     close(sock);
     return;
   }
 
-  // Compact line-oriented payload: "node:occupied:plate\n" -- one line per
-  // reading, sent as soon as it arrives (no more batching by lap). Swap this
-  // for whatever framing the ParkingVision backend expects once that API is
-  // defined -- video/plate-crop images never flow through here, only this
-  // small per-node text summary.
-  char line[16 + kMaxPlateLen];
-  int written = snprintf(line, sizeof(line), "%u:%u:%s", nodeId, occupied, plate);
+  // Compact line-oriented payload: "node:stream:occupied:plate\n" -- one
+  // line per reading, sent as soon as it arrives (no more batching by lap).
+  // Swap this for whatever framing the ParkingVision backend expects once
+  // that API is defined -- video/plate-crop images never flow through here,
+  // only this small per-lane text summary.
+  char line[20 + kMaxPlateLen];
+  int written = snprintf(line, sizeof(line), "%u:%u:%u:%s", nodeId, streamId, occupied, plate);
   if (written < static_cast<int>(sizeof(line))) {
     line[written++] = '\n';
   }

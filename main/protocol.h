@@ -21,21 +21,32 @@ struct __attribute__((packed)) HelloPacket {
   uint8_t chain_size = 0;
 };
 
-// One node's own parking-spot reading: is it occupied, and (if a car is
-// present and OCR succeeded) its plate text. Every node originates these on
+// One lane's parking-spot reading: is it occupied, and (if a car is present
+// and OCR succeeded downstream) its plate text. Every node covers
+// kVideoStreamsPerNode independent lanes (same split as the video streams --
+// see luckfox_spi.h/video_relay.cpp), so a reading needs stream_id to say
+// which one, exactly like VideoFrameHeader. Every node originates these on
 // its own initiative (no shared/collective packet, no waiting for a token to
 // pass through) and relays whatever it receives from `prev` toward `next` --
 // same pattern as video_relay.cpp. The Gateway has no `next`: it flushes
 // every packet it originates or receives straight to Ethernet instead of
 // forwarding. Video frames and plate crop images never travel this path --
 // they're far too large for ESP-NOW's 250-byte frame limit; only this small
-// derived result does. See docs/network/topology.md.
+// derived result does (plate crops go out over the video path instead, on a
+// reserved stream_id range -- see luckfox_spi.h). See docs/network/topology.md.
+//
+// plate[] is "" (unresolved) coming straight off LuckFox: the LuckFox Pico
+// Mini image has no OCR engine and no package manager to add one (see
+// luckfox/parking_detector.py), so plate text recognition happens on the
+// backend instead, against the plate crop image sent over the video path.
+// This field is wired up but stays empty until that backend step exists.
 struct __attribute__((packed)) StatusPacket {
   uint8_t type = kPktStatus;
   uint8_t origin_node_id = 0;
-  uint16_t seq = 0;                    // per-origin counter, dedups retransmits
-  uint8_t occupied = 0;                // 0 = kosong, 1 = terisi
-  char plate[kMaxPlateLen + 1] = {0};  // OCR'd plate text, "" if none/unreadable
+  uint8_t stream_id = 0;                // which of this node's lanes (0..kVideoStreamsPerNode-1)
+  uint16_t seq = 0;                     // per-(origin,stream) counter, dedups retransmits
+  uint8_t occupied = 0;                 // 0 = kosong, 1 = terisi
+  char plate[kMaxPlateLen + 1] = {0};   // OCR'd plate text, "" if none/unreadable/unresolved
 };
 
 // Sent immediately by a node back to whoever sent it a StatusPacket, once

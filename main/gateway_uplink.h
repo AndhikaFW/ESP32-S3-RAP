@@ -14,12 +14,12 @@ namespace gateway_uplink {
 // readings just fail to flush until the link recovers.
 bool init();
 
-// Sends one node's reading to the backend server over a plain TCP socket.
+// Sends one lane's reading to the backend server over a plain TCP socket.
 // Called once per StatusPacket the Gateway originates or receives (see
 // chain_node.cpp) -- there's no more "one flush per lap", each reading goes
 // out as soon as it arrives. Safe to call even if the link isn't up yet (it
 // will just fail fast and log).
-void flush(uint8_t nodeId, uint8_t occupied, const char *plate);
+void flush(uint8_t nodeId, uint8_t streamId, uint8_t occupied, const char *plate);
 
 // Queues one video frame -- already tagged by video_relay.cpp with which
 // node/stream/sequence it is -- for delivery to the backend over a second,

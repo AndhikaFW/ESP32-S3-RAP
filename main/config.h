@@ -113,6 +113,11 @@ constexpr size_t kVideoUplinkQueueDepth = 12;  // frames buffered for Ethernet d
 constexpr uint16_t kVideoPort = 5200;
 constexpr const char *kVideoApPassword = "rapvideo1";  // WPA2-PSK needs >=8 chars
 constexpr uint8_t kVideoStreamsPerNode = 3;             // 3x 600x400 streams per LuckFox
+// Plate crops (see main/luckfox_spi.h, luckfox/parking_detector.py) ride
+// this same video path, one reserved stream_id per lane above the real
+// video streams (lane N's crop is stream_id kPlateStreamBase+N) -- cheapest
+// way to get an image the backend can OCR to it without a third transport.
+constexpr uint8_t kPlateStreamBase = kVideoStreamsPerNode;
 // 512KB: sized for the PoC's PNG frames (no JPEG encoder available on the
 // LuckFox test image yet, see main/luckfox_spi.py -- a 600x400 PNG frame
 // measured ~366KB in practice) -- shrink back down once real JPEG/H.264

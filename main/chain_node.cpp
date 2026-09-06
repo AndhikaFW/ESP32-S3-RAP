@@ -40,6 +40,7 @@ State g_state = State::kDiscovering;
 uint32_t g_lastHelloMs = 0;
 uint32_t g_lastLocalMs = 0;
 uint16_t g_localSeq = 0;
+uint8_t g_localStream = 0;  // rotates 0..kVideoStreamsPerNode-1, one lane per tick
 
 // Dedup key for the last StatusPacket accepted from prev, so a retransmit
 // of the same content (because our ACK to prev got lost) just gets re-ACKed
@@ -63,20 +64,22 @@ uint32_t nowMs() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
 
 bool macEquals(const uint8_t *a, const uint8_t *b) { return memcmp(a, b, 6) == 0; }
 
-// Placeholder for the real spot status coming from the paired LuckFox Pico
-// Mini over SPI (motion -> AI car detection -> occupancy -> plate OCR). That
-// link isn't wired up in firmware yet -- swap this out once it is. Toggles
-// occupied on/off so readings visibly change during bring-up.
-void readLocalStatus(uint8_t *occupied, char plate[kMaxPlateLen + 1]) {
-  static bool toggle = false;
-  toggle = !toggle;
-  *occupied = toggle ? 1 : 0;
-  if (toggle) {
-    strncpy(plate, "TESTPLATE", kMaxPlateLen);
-    plate[kMaxPlateLen] = '\0';
-  } else {
-    plate[0] = '\0';
-  }
+// Latest reading per lane, pushed by setLaneStatus() (wired up as
+// luckfox_spi's StatusCallback -- see video_relay::init()) as LuckFox's own
+// motion -> parked-car check -> occupancy pipeline produces them. Starts at
+// "vacant, no plate" per lane, same as an empty spot, until the first real
+// reading arrives.
+uint8_t g_laneOccupied[kVideoStreamsPerNode] = {0};
+char g_lanePlate[kVideoStreamsPerNode][kMaxPlateLen + 1] = {{0}};
+
+// Pulls the latest cached reading for one lane (see g_laneOccupied/
+// g_lanePlate above). Every node covers kVideoStreamsPerNode lanes, so the
+// local-origination timer in loop() rotates through all of them round-robin
+// instead of a single reading per node.
+void readLocalStatus(uint8_t streamId, uint8_t *occupied, char plate[kMaxPlateLen + 1]) {
+  *occupied = g_laneOccupied[streamId];
+  strncpy(plate, g_lanePlate[streamId], kMaxPlateLen);
+  plate[kMaxPlateLen] = '\0';
 }
 
 void sendAck(const uint8_t *toMac, uint8_t originId, uint16_t seq) {
@@ -149,7 +152,7 @@ void handleStatus(const uint8_t *mac, const StatusPacket &pkt) {
     g_lastAcceptedOrigin = pkt.origin_node_id;
     g_lastAcceptedSeq = pkt.seq;
     sendAck(g_prevMac, pkt.origin_node_id, pkt.seq);
-    gateway_uplink::flush(pkt.origin_node_id, pkt.occupied, pkt.plate);
+    gateway_uplink::flush(pkt.origin_node_id, pkt.stream_id, pkt.occupied, pkt.plate);
     return;
   }
 
@@ -249,10 +252,12 @@ void loop() {
     g_lastLocalMs = nowMs();
     StatusPacket pkt{};
     pkt.origin_node_id = g_nodeId;
+    pkt.stream_id = g_localStream;
     pkt.seq = g_localSeq++;
-    readLocalStatus(&pkt.occupied, pkt.plate);
+    readLocalStatus(g_localStream, &pkt.occupied, pkt.plate);
+    g_localStream = static_cast<uint8_t>((g_localStream + 1) % kVideoStreamsPerNode);
     if (g_isGateway) {
-      gateway_uplink::flush(pkt.origin_node_id, pkt.occupied, pkt.plate);
+      gateway_uplink::flush(pkt.origin_node_id, pkt.stream_id, pkt.occupied, pkt.plate);
     } else if (xQueueSend(g_outQueue, &pkt, 0) != pdTRUE) {
       ESP_LOGW(kTag, "out queue full, dropping local reading");
     }
@@ -281,6 +286,15 @@ void loop() {
   if (xQueueReceive(g_outQueue, &next, 0) == pdTRUE) {
     beginForwarding(next);
   }
+}
+
+void setLaneStatus(uint8_t stream_id, uint8_t occupied, const char *plate) {
+  if (stream_id >= kVideoStreamsPerNode) {
+    return;  // out-of-range lane id, e.g. a plate-crop stream_id -- not a status reading
+  }
+  g_laneOccupied[stream_id] = occupied;
+  strncpy(g_lanePlate[stream_id], plate, kMaxPlateLen);
+  g_lanePlate[stream_id][kMaxPlateLen] = '\0';
 }
 
 }  // namespace chain_node

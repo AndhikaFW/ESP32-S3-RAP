@@ -21,16 +21,22 @@
 // the chunk buffer (rest zero-padded/ignored):
 //   uint32_t magic       -- kMagic, lets the slave resync if it ever misses
 //                            a transaction boundary (e.g. after a reset)
-//   uint8_t  stream_id
+//   uint8_t  msg_type     -- kMsgVideo or kMsgStatus, picks how data_len
+//                            bytes of payload are interpreted below
+//   uint8_t  stream_id    -- for kMsgVideo: which video lane, or a plate
+//                            crop for lane (stream_id - kPlateStreamBase);
+//                            for kMsgStatus: which lane this reading is for
 //   uint16_t seq
 //   uint32_t data_len     -- total payload bytes across all following chunks
 // Every following transaction until data_len bytes have been collected is a
 // raw payload chunk; the last one is only partially used (data_len mod
 // kLuckfoxSpiChunkBytes bytes of it), the rest is padding and discarded.
+// For kMsgVideo, the payload is the raw image bytes. For kMsgStatus, the
+// payload is a packed LaneStatusWire.
 //
-// See luckfox/spi_sender.py in the parent repo (LuckFox side, Python +
-// spidev, outside this firmware submodule) for the sender half of this
-// same protocol.
+// See luckfox/spi_sender.py and luckfox/parking_detector.py in the parent
+// repo (LuckFox side, Python + spidev, outside this firmware submodule) for
+// the sender half of this same protocol.
 namespace luckfox_spi {
 
 namespace {
@@ -38,14 +44,26 @@ namespace {
 constexpr const char *kTag = "luckfox_spi";
 constexpr uint32_t kMagic = 0x52415046;  // "RAPF"
 
+enum WireMsgType : uint8_t {
+  kMsgVideo = 0,
+  kMsgStatus = 1,
+};
+
 struct __attribute__((packed)) WireHeader {
   uint32_t magic;
+  uint8_t msg_type;
   uint8_t stream_id;
   uint16_t seq;
   uint32_t data_len;
 };
 
+struct __attribute__((packed)) LaneStatusWire {
+  uint8_t occupied;
+  char plate[kMaxPlateLen + 1];
+};
+
 FrameCallback g_onFrame;
+StatusCallback g_onStatus;
 
 // Reused DMA-capable scratch buffers for the SPI transaction itself -- the
 // slave driver requires tx/rx buffers to be DMA-capable memory, which PSRAM
@@ -96,8 +114,33 @@ void receiverTask(void * /*arg*/) {
       }
     }
 
-    if (hdr.data_len == 0 || hdr.data_len > kVideoMaxFrameBytes) {
+    if (hdr.msg_type == kMsgStatus) {
+      if (hdr.data_len != sizeof(LaneStatusWire)) {
+        ESP_LOGW(kTag, "bad status header (len=%u, want %u), resyncing", hdr.data_len,
+                 (unsigned)sizeof(LaneStatusWire));
+        continue;
+      }
+    } else if (hdr.data_len == 0 || hdr.data_len > kVideoMaxFrameBytes) {
       ESP_LOGW(kTag, "bad frame header (len=%u), resyncing", hdr.data_len);
+      continue;
+    }
+
+    // Status readings are tiny and always fit in one chunk -- handle them
+    // inline without the PSRAM frame-buffer path below (that's sized/tuned
+    // for multi-chunk images).
+    if (hdr.msg_type == kMsgStatus) {
+      if (!transactOnce()) {
+        ESP_LOGW(kTag, "status transaction failed, dropping reading");
+        continue;
+      }
+      LaneStatusWire status{};
+      memcpy(&status, g_rxScratch, sizeof(status));
+      status.plate[kMaxPlateLen] = '\0';  // guard against a non-terminated sender bug
+      ESP_LOGI(kTag, "status received: stream=%u occupied=%u plate=\"%s\"", hdr.stream_id,
+               status.occupied, status.plate);
+      if (g_onStatus) {
+        g_onStatus(hdr.stream_id, status.occupied, status.plate);
+      }
       continue;
     }
 
@@ -148,8 +191,9 @@ void receiverTask(void * /*arg*/) {
 
 }  // namespace
 
-void init(FrameCallback onFrame) {
+void init(FrameCallback onFrame, StatusCallback onStatus) {
   g_onFrame = std::move(onFrame);
+  g_onStatus = std::move(onStatus);
 
   g_rxScratch = static_cast<uint8_t *>(heap_caps_malloc(kLuckfoxSpiChunkBytes, MALLOC_CAP_DMA));
   g_txScratch = static_cast<uint8_t *>(heap_caps_malloc(kLuckfoxSpiChunkBytes, MALLOC_CAP_DMA));

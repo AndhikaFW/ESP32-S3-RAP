@@ -19,6 +19,7 @@
 #include "lwip/ip4_addr.h"
 #include "lwip/sockets.h"
 
+#include "chain_node.h"
 #include "config.h"
 #include "gateway_uplink.h"
 #include "luckfox_spi.h"
@@ -357,7 +358,7 @@ void init(uint8_t nodeId, uint8_t chainSize, bool isGateway) {
   }
 
   xTaskCreate(serverTask, "video_server", 4096, nullptr, 5, nullptr);
-  luckfox_spi::init(onLuckfoxFrame);
+  luckfox_spi::init(onLuckfoxFrame, chain_node::setLaneStatus);
 
   if (isGateway) {
     ESP_LOGI(kTag, "video_relay up: AP=%s (gateway, sink only)", apSsid);
