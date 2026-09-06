@@ -57,6 +57,13 @@ constexpr uint8_t kUnprovisioned = 0xFF;
 // breadboard, rewire ENC28J60's 4 SPI wires to GPIO4/5/6/7 (CS/SCK/MOSI/MISO
 // respectively) to match.
 constexpr spi_host_device_t kEncSpiHost = SPI3_HOST;
+// Tried lowering this to 2MHz to chase intermittent tx_ready_sem timeouts
+// (packets never finishing transmission) on the breadboard rig -- made no
+// difference (identical failure at 2MHz and 8MHz), so the timeout isn't an
+// SPI signal-integrity issue; back to 8MHz since this chip's silicon
+// revision (B7) is rated for it. See docs/network/enc28j60_wiring.dot --
+// the actual cause looks like the breadboard ENC28J60 module itself
+// (no proper magnetics/RJ45 circuit).
 constexpr int kEncSpiClockMhz = 8;
 constexpr int kEncCsPin = 7;
 constexpr int kEncSckPin = 6;

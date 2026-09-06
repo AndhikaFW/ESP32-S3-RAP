@@ -181,12 +181,6 @@ bool init() {
     ESP_LOGE(kTag, "creating ENC28J60 MAC instance failed");
     return false;
   }
-  // ENC28J60 Errata #1: silicon revisions below B5 need >=8MHz SPI clock.
-  if (emac_enc28j60_get_chip_info(mac) < ENC28J60_REV_B5 && kEncSpiClockMhz < 8) {
-    ESP_LOGE(kTag, "SPI clock must be >=8MHz for this ENC28J60 silicon revision");
-    mac->del(mac);
-    return false;
-  }
 
   eth_phy_config_t phyConfig = ETH_PHY_DEFAULT_CONFIG();
   phyConfig.autonego_timeout_ms = 0;  // ENC28J60 doesn't support auto-negotiation
@@ -206,6 +200,19 @@ bool init() {
     // keeps firing into a half-initialized driver and eventually crashes.
     mac->del(mac);
     phy->del(phy);
+    return false;
+  }
+
+  // ENC28J60 Errata #1: silicon revisions below B5 need >=8MHz SPI clock.
+  // Checked here (not before esp_eth_driver_install above) because
+  // emac_enc28j60_get_chip_info() just returns a struct field that's only
+  // populated by the real SPI chip-ID read inside init() -- calling it any
+  // earlier always sees the zero-initialized default, so the check silently
+  // never passed regardless of the actual chip's revision (caught when
+  // dropping kEncSpiClockMhz below 8 failed this on a confirmed-B7 chip).
+  if (emac_enc28j60_get_chip_info(mac) < ENC28J60_REV_B5 && kEncSpiClockMhz < 8) {
+    ESP_LOGE(kTag, "SPI clock must be >=8MHz for this ENC28J60 silicon revision");
+    esp_eth_driver_uninstall(g_ethHandle);
     return false;
   }
 
