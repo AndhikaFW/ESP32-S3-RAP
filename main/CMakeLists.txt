@@ -6,6 +6,7 @@ idf_component_register(
         "chain_node.cpp"
         "gateway_uplink.cpp"
         "video_relay.cpp"
+        "luckfox_spi.cpp"
     INCLUDE_DIRS "."
     REQUIRES esp_wifi esp_event esp_netif nvs_flash esp_eth driver esp_driver_gpio esp_driver_spi esp_timer lwip
              heap esp_hw_support

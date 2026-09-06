@@ -16,7 +16,7 @@
 
 namespace {
 constexpr const char *kTag = "main";
-}
+}  // namespace
 
 // Boot sequence: NVS -> shared netif/event loop -> WiFi netifs (video_relay
 // needs both created before esp_wifi_start(), which espnow::init() below

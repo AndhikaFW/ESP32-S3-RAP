@@ -27,15 +27,15 @@ digraph EncWiring {
     }
 
     subgraph cluster_esp {
-        label="ESP32-S3 (Gateway, node_id=0) -- SPI2_HOST, 8MHz";
+        label="ESP32-S3 (Gateway, node_id=0) -- SPI3_HOST, 8MHz\n(GPIO matrix, not IOMUX -- see luckfox_spi_wiring.dot for why\nSPI2_HOST's IOMUX pins went to the LuckFox link instead)";
         style="rounded,filled";
         fillcolor="#ebf8ff";
         color="#2b6cb0";
         node [shape=box, style="rounded,filled", fillcolor="#bee3f8", color="#2c5282"];
-        ESP_CS   [label="GPIO10 (kEncCsPin)"];
-        ESP_SCK  [label="GPIO12 (kEncSckPin)"];
-        ESP_MOSI [label="GPIO11 (kEncMosiPin)"];
-        ESP_MISO [label="GPIO13 (kEncMisoPin)"];
+        ESP_CS   [label="GPIO7 (kEncCsPin)"];
+        ESP_SCK  [label="GPIO6 (kEncSckPin)"];
+        ESP_MOSI [label="GPIO4 (kEncMosiPin)"];
+        ESP_MISO [label="GPIO5 (kEncMisoPin)"];
         ESP_INT  [label="GPIO9 (kEncIntPin)"];
         ESP_3V3  [label="3V3"];
         ESP_GND  [label="GND"];

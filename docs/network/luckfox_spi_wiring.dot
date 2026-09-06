@@ -1,0 +1,47 @@
+digraph LuckfoxSpiWiring {
+    rankdir=LR;
+    bgcolor="white";
+    fontname="Helvetica";
+    node [fontname="Helvetica", fontsize=11];
+    edge [fontname="Helvetica", fontsize=10];
+
+    labelloc="t";
+    label="Wiring LuckFox Pico Mini (RV1103) <-> ESP32-S3 (SPI slave, per-node link)";
+    fontsize=15;
+
+    subgraph cluster_luckfox {
+        label="LuckFox Pico Mini (RV1103) -- J1 header, 2x11, SPI0 M0 (Linux spidev0.0, master)";
+        style="rounded,filled";
+        fillcolor="#ebf8ff";
+        color="#2b6cb0";
+        node [shape=box, style="rounded,filled", fillcolor="#bee3f8", color="#2c5282"];
+        LF_CS   [label="J1 pin 6\nSPI0_M0_CS0 (GPIO1_C0)"];
+        LF_SCK  [label="J1 pin 7\nSPI0_M0_CLK (GPIO1_C1)"];
+        LF_MOSI [label="J1 pin 8\nSPI0_M0_MOSI (GPIO1_C2)"];
+        LF_MISO [label="J1 pin 9\nSPI0_M0_MISO (GPIO1_C3)"];
+        LF_GND  [label="J1 pin 2 (or 21)\nGND"];
+        LF_VBUS [label="J1 pin 1\nVBUS (5V, own USB supply --\nnot connected to ESP32)"];
+    }
+
+    subgraph cluster_esp {
+        label="ESP32-S3-DevKitC-1 (44-pin) -- SPI2_HOST, slave, kLuckfoxSpiHost\n(SPI2_HOST chosen for its dedicated IOMUX fast path -- required for\nreliable SPI *slave* operation; see config.h comment)";
+        style="rounded,filled";
+        fillcolor="#faf5ff";
+        color="#6b46c1";
+        node [shape=box, style="rounded,filled", fillcolor="#e9d8fd", color="#553c9a"];
+        ESP_CS   [label="GPIO10 (kLuckfoxSpiCsPin)\nFSPICS0"];
+        ESP_SCK  [label="GPIO12 (kLuckfoxSpiSckPin)\nFSPICLK"];
+        ESP_MOSI [label="GPIO11 (kLuckfoxSpiMosiPin)\nFSPID"];
+        ESP_MISO [label="GPIO13 (kLuckfoxSpiMisoPin)\nFSPIQ"];
+        ESP_GND  [label="GND"];
+    }
+
+    LF_CS -> ESP_CS [label="  CS", color="#805ad5", penwidth=1.5];
+    LF_SCK -> ESP_SCK [label="  CLK", color="#805ad5", penwidth=1.5];
+    LF_MOSI -> ESP_MOSI [label="  data (LuckFox -> ESP32)", color="#2b6cb0", penwidth=2];
+    ESP_MISO -> LF_MISO [label="  data (ESP32 -> LuckFox)", color="#c53030", penwidth=2, dir=back];
+    LF_GND -> ESP_GND [dir=none, style=dashed, color="#4a5568", label="  shared GND (required --\n  two independent USB supplies)"];
+
+    NOTE [shape=note, style=filled, fillcolor="#fefcbf", color="#b7791f", fontsize=10,
+          label="LuckFox is the SPI *master* (Linux spidev is master-only); ESP32-S3 is the *slave*\n(driver/spi_slave.h). Do NOT connect LF_VBUS to the ESP32 -- each board keeps its own\nUSB power; only GND is shared between them. This ESP32 GPIO set (10/11/12/13) is the\nchip's SPI2_HOST IOMUX pins -- moving the LuckFox link off them (e.g. onto SPI3_HOST's\narbitrary GPIO4-7) was root-caused to silent SPI-slave transaction failures during\nbring-up: everything else (wiring, LuckFox-side loopback, plain-GPIO loopback on the\nESP32) checked out, but the real hardware SPI slave never completed a transaction until\nmoved onto these pins. If this node is also the Gateway (has ENC28J60), that module now\nuses GPIO4/5/6/7 instead -- see enc28j60_wiring.dot/.png (updated to match)."];
+}

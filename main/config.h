@@ -46,12 +46,22 @@ constexpr const char *kNvsKeyChainSize = "chain_size";
 constexpr uint8_t kUnprovisioned = 0xFF;
 
 // -- ENC28J60 SPI wiring (Gateway node only) --
-constexpr spi_host_device_t kEncSpiHost = SPI2_HOST;
+//
+// SPI3_HOST here (not SPI2_HOST) -- see the LuckFox SPI link section below
+// for why: ESP32-S3 only has one SPI controller with a dedicated IOMUX fast
+// path (SPI2_HOST, pins GPIO10/11/12/13), and the LuckFox link needs it far
+// more (it's the SPI *slave*, which is unreliable on the GPIO-matrix-routed
+// host). ENC28J60 is master-only here and tolerates the GPIO matrix's extra
+// routing delay fine, so it gives up the IOMUX pins in this swap. On the
+// real shield PCB this is moot (both are fixed traces); on a dev-board
+// breadboard, rewire ENC28J60's 4 SPI wires to GPIO4/5/6/7 (CS/SCK/MOSI/MISO
+// respectively) to match.
+constexpr spi_host_device_t kEncSpiHost = SPI3_HOST;
 constexpr int kEncSpiClockMhz = 8;
-constexpr int kEncCsPin = 10;
-constexpr int kEncSckPin = 12;
-constexpr int kEncMisoPin = 13;
-constexpr int kEncMosiPin = 11;
+constexpr int kEncCsPin = 7;
+constexpr int kEncSckPin = 6;
+constexpr int kEncMisoPin = 5;
+constexpr int kEncMosiPin = 4;
 constexpr int kEncIntPin = 9;
 
 // Locally-administered MAC for the ENC28J60 side; only needs to be unique on
@@ -96,6 +106,43 @@ constexpr size_t kVideoUplinkQueueDepth = 12;  // frames buffered for Ethernet d
 constexpr uint16_t kVideoPort = 5200;
 constexpr const char *kVideoApPassword = "rapvideo1";  // WPA2-PSK needs >=8 chars
 constexpr uint8_t kVideoStreamsPerNode = 3;             // 3x 600x400 streams per LuckFox
-constexpr size_t kVideoMaxFrameBytes = 32 * 1024;       // sanity cap per frame
+// 512KB: sized for the PoC's PNG frames (no JPEG encoder available on the
+// LuckFox test image yet, see main/luckfox_spi.py -- a 600x400 PNG frame
+// measured ~366KB in practice) -- shrink back down once real JPEG/H.264
+// encoding lands on the LuckFox side (original placeholder assumed ~15-23KB
+// JPEG frames).
+constexpr size_t kVideoMaxFrameBytes = 512 * 1024;
 constexpr size_t kVideoQueueDepth = 12;                 // frames buffered in PSRAM, in flight to next
 constexpr uint32_t kVideoLocalFrameIntervalMs = 300;    // placeholder producer cadence, see video_relay.cpp
+
+// -- LuckFox <-> ESP32 SPI link (every node, not just the Gateway) --
+//
+// ESP32-S3 is the SPI *slave* here (driver/spi_slave.h) -- LuckFox's Linux
+// side already owns /dev/spidev0.0 in master mode (enabled via
+// `luckfox-config`'s SPI0 M0 overlay; Linux spidev is master-only, and this
+// firmware already uses spi_master.h for the Gateway's ENC28J60, so LuckFox
+// stays master and ESP32 is the slave here to avoid a two-master bus).
+//
+// SPI2_HOST specifically (not SPI3_HOST) -- ESP32-S3 only gives ONE SPI
+// controller a dedicated IOMUX fast path (SPI2_HOST: CS0=GPIO10, SCK=GPIO12,
+// MOSI/FSPID=GPIO11, MISO/FSPIQ=GPIO13); SPI3_HOST has no IOMUX pins at all
+// and is always routed through the slower/less precise GPIO matrix. That's
+// fine for a *master* (it drives its own clock and tolerates the extra
+// delay), but ESP-IDF's SPI *slave* driver needs to sample an externally-
+// generated clock and is known to be unreliable -- transactions can fail to
+// complete at all, regardless of clock speed -- when routed through the GPIO
+// matrix instead of IOMUX. Root-caused after the ENC28J60 (a master) sat on
+// these same IOMUX pins and worked fine there while the LuckFox slave link
+// on arbitrary GPIO4/5/6/7 (GPIO-matrix-routed) never completed a single
+// transaction despite every other layer (wiring, LuckFox-side spidev
+// loopback, this firmware's own GPIO-level loopback) checking out perfectly.
+// See ENC28J60 section above for its swapped-out pins.
+constexpr spi_host_device_t kLuckfoxSpiHost = SPI2_HOST;
+constexpr int kLuckfoxSpiMosiPin = 11;
+constexpr int kLuckfoxSpiMisoPin = 13;
+constexpr int kLuckfoxSpiSckPin = 12;
+constexpr int kLuckfoxSpiCsPin = 10;
+// Per-transaction chunk size for the slave's DMA-backed recv buffer. Frames
+// larger than this are split into ceil(len/chunk) chunks by the LuckFox-side
+// sender (see main/luckfox_spi.py); must match on both ends.
+constexpr size_t kLuckfoxSpiChunkBytes = 4000;

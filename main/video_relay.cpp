@@ -9,7 +9,6 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
-#include "esp_random.h"
 #include "esp_wifi.h"
 
 #include "freertos/FreeRTOS.h"
@@ -22,6 +21,7 @@
 
 #include "config.h"
 #include "gateway_uplink.h"
+#include "luckfox_spi.h"
 
 namespace video_relay {
 
@@ -276,31 +276,14 @@ void clientTask(void * /*arg*/) {
 }
 
 // -------------------------------------------------------------------------
-// Placeholder local source: stands in for the real SPI link from this
-// node's paired LuckFox (motion -> AI -> encode, see docs/network/
-// topology.md) until that's wired up. Cycles through the kVideoStreamsPerNode
-// streams one at a time (round-robin), producing plausibly-sized frames.
+// Local source: frames arriving over SPI from this node's paired LuckFox
+// (see main/luckfox_spi.*). Runs on luckfox_spi's own receiver task context,
+// not a task of its own here -- just wraps the raw bytes in a FrameHeader
+// and drops them on the same queue as relayed frames.
 // -------------------------------------------------------------------------
-void localProducerTask(void * /*arg*/) {
-  uint16_t seq[kVideoStreamsPerNode] = {0};
-  uint8_t stream = 0;
-
-  while (true) {
-    vTaskDelay(pdMS_TO_TICKS(kVideoLocalFrameIntervalMs));
-
-    size_t size = 15000 + (esp_random() % 8000);  // ~15-23KB, placeholder JPEG-ish size
-    auto *data = allocFrameBuffer(size);
-    if (data == nullptr) {
-      ESP_LOGW(kTag, "alloc failed for local frame, skipping");
-      continue;
-    }
-    memset(data, 0xAA, size);  // placeholder content, no real encoder yet
-
-    FrameHeader hdr{g_nodeId, stream, seq[stream]++, static_cast<uint32_t>(size)};
-    enqueueOrDrop(new Frame{hdr, data});
-
-    stream = static_cast<uint8_t>((stream + 1) % kVideoStreamsPerNode);
-  }
+void onLuckfoxFrame(uint8_t stream_id, uint16_t seq, uint8_t *data, uint32_t len) {
+  FrameHeader hdr{g_nodeId, stream_id, seq, len};
+  enqueueOrDrop(new Frame{hdr, data});
 }
 
 void wifiEventHandler(void * /*arg*/, esp_event_base_t base, int32_t id, void *data) {
@@ -374,7 +357,7 @@ void init(uint8_t nodeId, uint8_t chainSize, bool isGateway) {
   }
 
   xTaskCreate(serverTask, "video_server", 4096, nullptr, 5, nullptr);
-  xTaskCreate(localProducerTask, "video_producer", 4096, nullptr, 4, nullptr);
+  luckfox_spi::init(onLuckfoxFrame);
 
   if (isGateway) {
     ESP_LOGI(kTag, "video_relay up: AP=%s (gateway, sink only)", apSsid);
