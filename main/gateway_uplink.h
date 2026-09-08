@@ -22,13 +22,18 @@ bool init();
 void flush(uint8_t nodeId, uint8_t streamId, uint8_t occupied, const char *plate);
 
 // Queues one video frame -- already tagged by video_relay.cpp with which
-// node/stream/sequence it is -- for delivery to the backend over a second,
-// persistent TCP connection (kept open rather than reconnected per frame
-// like flush() above, since video arrives far more often than a reading).
-// Always takes ownership of `data` (heap_caps_malloc'd by the caller): it
-// gets freed here whether the frame is actually sent, dropped for a full
-// queue, or dropped because the link isn't up / this isn't the Gateway.
-// Safe to call from any task.
+// node/stream/sequence it is -- for delivery to the backend over a second
+// socket, UDP rather than flush()'s TCP (see kVideoBackendPort's comment
+// in config.h for why: video can tolerate a dropped frame, and skipping
+// TCP's delivery-guarantee machinery buys back real throughput on this
+// link). Split into kVideoUdpChunkBytes-sized chunks by gateway_uplink.cpp
+// (see VideoChunkHeader there) since a frame is almost always bigger than
+// one safe UDP datagram; the backend reassembles (see
+// backend/video_listener.py), discarding a frame if its chunks don't all
+// arrive within kVideoUdpFrameTimeoutMs. Always takes ownership of `data`
+// (heap_caps_malloc'd by the caller): it gets freed here whether the frame
+// is actually sent, dropped for a full queue, or dropped because the link
+// isn't up / this isn't the Gateway. Safe to call from any task.
 void flushVideo(uint8_t originNodeId, uint8_t streamId, uint16_t seq, uint8_t *data, uint32_t dataLen);
 
 }  // namespace gateway_uplink

@@ -1,5 +1,6 @@
 #include "gateway_uplink.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -42,11 +43,18 @@ struct VideoItem {
   uint8_t *data;
 };
 
-struct __attribute__((packed)) VideoFrameHeader {
+// One UDP datagram's worth of one video frame -- see kVideoUdpChunkBytes's
+// comment in config.h for why chunked-over-UDP instead of one TCP stream.
+// chunk_count is repeated on every chunk (not just chunk 0) since UDP
+// datagrams can arrive out of order or chunk 0 can simply be the one that's
+// lost -- the backend needs to know the total from whichever chunks
+// actually show up (see backend/video_listener.py's reassembly).
+struct __attribute__((packed)) VideoChunkHeader {
   uint8_t origin_node_id;
   uint8_t stream_id;  // which of this node's kVideoStreamsPerNode cameras
-  uint16_t seq;
-  uint32_t data_len;
+  uint16_t seq;        // which frame
+  uint16_t chunk_index;
+  uint16_t chunk_count;
 };
 
 QueueHandle_t g_videoQueue = nullptr;
@@ -57,64 +65,72 @@ void freeVideoItem(VideoItem *item) {
   delete item;
 }
 
-bool sendAllTcp(int sock, const void *buf, size_t len) {
-  const uint8_t *p = static_cast<const uint8_t *>(buf);
-  size_t sent = 0;
-  while (sent < len) {
-    ssize_t n = send(sock, p + sent, len - sent, 0);
-    if (n <= 0) return false;
-    sent += static_cast<size_t>(n);
-  }
-  return true;
-}
-
-// Drains g_videoQueue over a persistent TCP connection to the backend --
-// unlike flush()'s per-reading connect/send/close, video arrives far more
-// often, so paying a fresh handshake per frame would waste a meaningful
-// slice of the ENC28J60's 10Mbps budget. Reconnects on failure/link-down.
+// Drains g_videoQueue over a UDP socket, one connect() at task start (UDP
+// has no connection to lose, so unlike the old TCP version there's nothing
+// to reconnect -- connect() on a datagram socket just fixes the default
+// destination for send() and filters unrelated incoming packets, it
+// doesn't establish a session). Splits each frame into
+// ceil(data_len / kVideoUdpChunkBytes) datagrams; a send() failure just
+// drops the rest of that one frame's chunks (logged, not retried -- see
+// kVideoBackendPort's comment in config.h for why that's an acceptable
+// trade for this link).
 void videoUplinkTask(void * /*arg*/) {
+  int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (sock < 0) {
+    ESP_LOGE(kTag, "video uplink socket() failed, video will never be sent");
+    vTaskDelete(nullptr);
+    return;
+  }
+  sockaddr_in dest{};
+  dest.sin_family = AF_INET;
+  dest.sin_port = htons(kVideoBackendPort);
+  inet_pton(AF_INET, kBackendHost, &dest.sin_addr);
+  // Just fixes this UDP socket's default destination for send() below --
+  // unlike TCP, no handshake happens, so a bad kBackendHost is the only
+  // realistic failure mode here (and that's a config bug, not a runtime
+  // condition to retry on).
+  if (connect(sock, reinterpret_cast<sockaddr *>(&dest), sizeof(dest)) != 0) {
+    ESP_LOGE(kTag, "video uplink connect() failed, video will never be sent");
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  uint8_t chunkBuf[sizeof(VideoChunkHeader) + kVideoUdpChunkBytes];
+  auto *chunkHdr = reinterpret_cast<VideoChunkHeader *>(chunkBuf);
+  uint8_t *chunkPayload = chunkBuf + sizeof(VideoChunkHeader);
+
   while (true) {
+    VideoItem *item = nullptr;
+    if (xQueueReceive(g_videoQueue, &item, pdMS_TO_TICKS(1000)) != pdTRUE) {
+      continue;
+    }
     if (!g_linkUp) {
-      vTaskDelay(pdMS_TO_TICKS(500));
-      continue;
-    }
-
-    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock < 0) {
-      vTaskDelay(pdMS_TO_TICKS(1000));
-      continue;
-    }
-    sockaddr_in dest{};
-    dest.sin_family = AF_INET;
-    dest.sin_port = htons(kVideoBackendPort);
-    inet_pton(AF_INET, kBackendHost, &dest.sin_addr);
-
-    timeval tv{};
-    tv.tv_sec = 2;
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
-    if (connect(sock, reinterpret_cast<sockaddr *>(&dest), sizeof(dest)) != 0) {
-      ESP_LOGW(kTag, "video uplink connect to %s:%u failed", kBackendHost, kVideoBackendPort);
-      close(sock);
-      vTaskDelay(pdMS_TO_TICKS(1000));
-      continue;
-    }
-    ESP_LOGI(kTag, "video uplink connected to %s:%u", kBackendHost, kVideoBackendPort);
-
-    bool linkOk = true;
-    while (linkOk) {
-      VideoItem *item = nullptr;
-      if (xQueueReceive(g_videoQueue, &item, pdMS_TO_TICKS(1000)) != pdTRUE) {
-        continue;  // nothing to send right now, keep the connection warm
-      }
-      VideoFrameHeader hdr{item->origin_node_id, item->stream_id, item->seq, item->data_len};
-      linkOk = sendAllTcp(sock, &hdr, sizeof(hdr)) && sendAllTcp(sock, item->data, item->data_len);
       freeVideoItem(item);
+      continue;
     }
 
-    close(sock);
-    ESP_LOGW(kTag, "video uplink connection lost, retrying");
-    vTaskDelay(pdMS_TO_TICKS(500));
+    uint16_t chunkCount = static_cast<uint16_t>(
+        (item->data_len + kVideoUdpChunkBytes - 1) / kVideoUdpChunkBytes);
+    if (chunkCount == 0) chunkCount = 1;  // still send one (empty) chunk for a zero-length frame
+
+    chunkHdr->origin_node_id = item->origin_node_id;
+    chunkHdr->stream_id = item->stream_id;
+    chunkHdr->seq = item->seq;
+    chunkHdr->chunk_count = chunkCount;
+
+    for (uint16_t i = 0; i < chunkCount; i++) {
+      size_t offset = static_cast<size_t>(i) * kVideoUdpChunkBytes;
+      size_t remaining = static_cast<size_t>(item->data_len) - offset;
+      size_t len = std::min(kVideoUdpChunkBytes, remaining);
+      chunkHdr->chunk_index = i;
+      memcpy(chunkPayload, item->data + offset, len);
+      if (send(sock, chunkBuf, sizeof(VideoChunkHeader) + len, 0) < 0) {
+        ESP_LOGW(kTag, "video chunk send failed, dropping rest of node=%u stream=%u seq=%u",
+                 item->origin_node_id, item->stream_id, item->seq);
+        break;
+      }
+    }
+    freeVideoItem(item);
   }
 }
 
@@ -144,7 +160,11 @@ bool init() {
   // fail below: flushVideo() must stay safe to call (it just drops frames
   // while g_linkUp is false) even if the Ethernet driver never comes up.
   g_videoQueue = xQueueCreate(kVideoUplinkQueueDepth, sizeof(VideoItem *));
-  xTaskCreate(videoUplinkTask, "video_uplink", 4096, nullptr, 4, nullptr);
+  // 6144, not the old TCP version's 4096 -- videoUplinkTask now keeps a
+  // sizeof(VideoChunkHeader)+kVideoUdpChunkBytes (~1.4KB) scratch buffer on
+  // its own stack frame for building each outgoing chunk, on top of the
+  // usual FreeRTOS/lwIP call-chain overhead the old 4096 was sized for.
+  xTaskCreate(videoUplinkTask, "video_uplink", 6144, nullptr, 4, nullptr);
 
   // Shared ISR service the enc28j60 driver needs for its interrupt GPIO;
   // ESP_ERR_INVALID_STATE just means something else already installed it.

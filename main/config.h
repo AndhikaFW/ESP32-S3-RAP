@@ -96,11 +96,30 @@ constexpr const char *kBackendHost = kEthStaticGateway;
 constexpr uint16_t kBackendPort = 5000;
 
 // Video frames (tagged with origin node/stream, see video_relay.h) go out
-// over the same Ethernet link but on their own port/connection, kept open
-// rather than reconnected per frame like kBackendPort above -- framing and
-// arrival rate are both completely different from the status line.
+// over the same Ethernet link but on their own port, over UDP rather than
+// TCP -- a dropped/late frame is fine to just skip (the next one is only
+// ~300ms away), and losing the delivery-guarantee/retransmit/window
+// machinery TCP would otherwise spend SPI transactions on directly buys
+// back throughput on this link (see gateway_uplink.cpp's module docstring
+// and W5500's own published SPI-clock-vs-throughput numbers -- ACK/window
+// bookkeeping dominates over raw payload at these clock speeds). Unlike
+// kBackendPort's status line above, an unreliable transport is fine here
+// specifically because a lost video frame has no lasting consequence, only
+// a skipped frame in the feed.
 constexpr uint16_t kVideoBackendPort = 5300;
 constexpr size_t kVideoUplinkQueueDepth = 12;  // frames buffered for Ethernet delivery
+// UDP payload per chunk -- comfortably under the 1500B Ethernet MTU once
+// the 8B chunk header and IP/UDP headers (28B) are added, so no IP-level
+// fragmentation (which would turn one lost fragment into one lost chunk
+// *and* corrupt reassembly of every other chunk sharing that IP packet ID
+// -- application-level chunking avoids that entirely by never producing a
+// UDP payload big enough to fragment in the first place).
+constexpr size_t kVideoUdpChunkBytes = 1400;
+// How long the backend should wait for a frame's remaining chunks before
+// giving up and discarding what it has -- see backend/video_listener.py.
+// Generous next to the ~300ms inter-frame interval so it only fires on a
+// genuinely incomplete frame, not normal jitter.
+constexpr uint32_t kVideoUdpFrameTimeoutMs = 2000;
 
 // -- Video relay (separate radio path from ESP-NOW; see docs/network/topology.md) --
 //
@@ -118,12 +137,19 @@ constexpr uint8_t kVideoStreamsPerNode = 3;             // 3x 600x400 streams pe
 // video streams (lane N's crop is stream_id kPlateStreamBase+N) -- cheapest
 // way to get an image the backend can OCR to it without a third transport.
 constexpr uint8_t kPlateStreamBase = kVideoStreamsPerNode;
-// 512KB: sized for the PoC's PNG frames (no JPEG encoder available on the
-// LuckFox test image yet, see main/luckfox_spi.py -- a 600x400 PNG frame
-// measured ~366KB in practice) -- shrink back down once real JPEG/H.264
-// encoding lands on the LuckFox side (original placeholder assumed ~15-23KB
-// JPEG frames).
-constexpr size_t kVideoMaxFrameBytes = 512 * 1024;
+// 256KB: shrunk from the original 512KB now that real video frames are
+// hardware H.264 (luckfox/rkvenc_subprocess.py -- RV1103's own VENC
+// block), not the old PNG placeholder (a 600x400 video-stream PNG
+// measured ~366KB; H.264 measured ~21KB for an I-frame, ~20-40 bytes for
+// an unchanged P-frame -- comfortably under even a much smaller cap).
+// Still 256KB, not smaller, because *plate crops* also ride this same
+// path (see PLATE_STREAM_BASE) and stayed PNG at full source resolution,
+// not downsampled -- the fallback heuristic crop specifically
+// (_car_box_fallback_plate_crop() in spi_sender.py, used when the plate
+// detector itself finds nothing) can cover most of a car's width/height,
+// unlike the normal tight plate-only crop, and hasn't been measured
+// worst-case yet.
+constexpr size_t kVideoMaxFrameBytes = 256 * 1024;
 constexpr size_t kVideoQueueDepth = 12;                 // frames buffered in PSRAM, in flight to next
 constexpr uint32_t kVideoLocalFrameIntervalMs = 300;    // placeholder producer cadence, see video_relay.cpp
 
