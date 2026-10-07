@@ -1,5 +1,6 @@
 #include "video_relay.h"
 
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -45,6 +46,20 @@ uint8_t g_nextId = 0;
 bool g_isGateway = false;
 char g_nextIp[16] = {0};  // "next" node's AP IP, e.g. "192.168.11.1"
 
+// Health counters for logStats(); written from several tasks, only read for
+// the stats line, so torn/stale reads are harmless and no locking is used.
+std::atomic<uint32_t> g_vLocal{0};      // frames produced by this node's LuckFox (or the self-test)
+std::atomic<uint32_t> g_vIn{0};         // frames received from prev
+std::atomic<uint32_t> g_vOut{0};        // frames sent to next
+std::atomic<uint32_t> g_vOutBytes{0};
+std::atomic<uint32_t> g_vDrop{0};       // dropped: queue full / alloc failed
+std::atomic<uint32_t> g_vSunk{0};       // Gateway: frames handed to the uplink
+std::atomic<uint32_t> g_vBad{0};        // Gateway self-test: frames whose payload did not verify
+std::atomic<uint32_t> g_vReconnects{0}; // client connects to next (after the first = recoveries)
+std::atomic<uint32_t> g_vPrevDrops{0};  // prev connections lost (timeout / reset)
+volatile bool g_serverUp = false;    // prev currently connected to our server
+volatile bool g_clientUp = false;    // we are currently connected to next
+
 // Frames waiting to go out to `next`: both this node's own local frames and
 // whatever it received from `prev` land in the same FIFO, which is what
 // gives the round-robin interleaving between "my frames" and "relayed
@@ -87,7 +102,27 @@ uint8_t *allocFrameBuffer(size_t size) {
 // (frame->header already carries origin_node_id/stream_id/seq, so the
 // backend can always tell which node/camera/frame this is, the same as
 // StatusPacket's plate readings via gateway_uplink::flush()).
+// Self-test payload: byte i of a frame is a pure function of (origin, stream,
+// seq, i), so the Gateway can verify any frame that arrives -- whichever
+// hop it crossed -- without needing a copy to compare against.
+inline uint8_t selfTestByte(uint8_t origin, uint8_t stream, uint16_t seq, size_t i) {
+  return static_cast<uint8_t>(seq + stream * 17 + origin * 3 + i * 7);
+}
+
+bool selfTestFrameOk(const Frame *frame) {
+  const FrameHeader &h = frame->header;
+  if (h.data_len != kSelfTestFrameBytes) return false;
+  for (size_t i : {size_t{0}, size_t{1}, size_t{h.data_len / 2}, size_t{h.data_len - 1}}) {
+    if (frame->data[i] != selfTestByte(h.origin_node_id, h.stream_id, h.seq, i)) return false;
+  }
+  return true;
+}
+
 void sinkFrame(Frame *frame) {
+  g_vSunk++;
+  if (kChainSelfTest && !selfTestFrameOk(frame)) {
+    g_vBad++;
+  }
   gateway_uplink::flushVideo(frame->header.origin_node_id, frame->header.stream_id, frame->header.seq,
                               frame->data, frame->header.data_len);
   frame->data = nullptr;  // ownership just transferred to gateway_uplink
@@ -103,8 +138,7 @@ void enqueueOrDrop(Frame *frame) {
     return;
   }
   if (xQueueSend(g_outQueue, &frame, pdMS_TO_TICKS(50)) != pdTRUE) {
-    ESP_LOGW(kTag, "out queue full, dropping node=%u stream=%u", frame->header.origin_node_id,
-             frame->header.stream_id);
+    g_vDrop++;  // counted in logStats(); a stalled hop would otherwise log per frame
     freeFrame(frame);
   }
 }
@@ -200,10 +234,21 @@ void serverTask(void * /*arg*/) {
     int client = accept(listenSock, nullptr, nullptr);
     if (client < 0) continue;
     ESP_LOGI(kTag, "prev connected");
+    g_serverUp = true;
+
+    // A silent peer (reset/powered off: no FIN) must not leave this blocking
+    // recv() hanging forever -- see kVideoRecvTimeoutMs in config.h.
+    timeval rcvTimeout{};
+    rcvTimeout.tv_sec = kVideoRecvTimeoutMs / 1000;
+    rcvTimeout.tv_usec = (kVideoRecvTimeoutMs % 1000) * 1000;
+    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &rcvTimeout, sizeof(rcvTimeout));
 
     while (true) {
       FrameHeader hdr;
       if (!recvAll(client, &hdr, sizeof(hdr))) break;
+      if (hdr.stream_id == kVideoHeartbeatStream && hdr.data_len == 0) {
+        continue;  // keepalive from prev, nothing to relay
+      }
       if (hdr.data_len == 0 || hdr.data_len > kVideoMaxFrameBytes) {
         ESP_LOGW(kTag, "bad frame header (len=%u), dropping connection", hdr.data_len);
         break;
@@ -211,6 +256,7 @@ void serverTask(void * /*arg*/) {
 
       auto *data = allocFrameBuffer(hdr.data_len);
       if (data == nullptr) {
+        g_vDrop++;
         ESP_LOGW(kTag, "frame alloc failed (%u bytes), dropping frame", hdr.data_len);
         // Still have to drain the payload off the socket to stay framed.
         uint8_t scratch[256];
@@ -227,10 +273,13 @@ void serverTask(void * /*arg*/) {
         break;
       }
 
+      g_vIn++;
       enqueueOrDrop(new Frame{hdr, data});
     }
 
     close(client);
+    g_serverUp = false;
+    g_vPrevDrops++;
     ESP_LOGW(kTag, "prev disconnected");
   }
 }
@@ -258,18 +307,36 @@ void clientTask(void * /*arg*/) {
       continue;
     }
     ESP_LOGI(kTag, "connected to next (node %u)", g_nextId);
+    g_clientUp = true;
+    g_vReconnects++;
+
+    // Don't let a stalled receiver block send() forever either.
+    timeval sndTimeout{};
+    sndTimeout.tv_sec = 5;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &sndTimeout, sizeof(sndTimeout));
 
     bool linkOk = true;
     while (linkOk) {
       Frame *frame = nullptr;
-      if (xQueueReceive(g_outQueue, &frame, pdMS_TO_TICKS(1000)) != pdTRUE) {
-        continue;  // nothing to send right now, keep the connection warm
+      if (xQueueReceive(g_outQueue, &frame, pdMS_TO_TICKS(kVideoHeartbeatMs)) != pdTRUE) {
+        // Idle: say so, so the receiver's recv timeout can tell "quiet" from "dead".
+        FrameHeader heartbeat{0, kVideoHeartbeatStream, 0, 0};
+        linkOk = sendAll(sock, &heartbeat, sizeof(heartbeat));
+        continue;
       }
+      uint32_t len = frame->header.data_len;
       linkOk = sendAll(sock, &frame->header, sizeof(frame->header)) &&
-               sendAll(sock, frame->data, frame->header.data_len);
+               sendAll(sock, frame->data, len);
+      if (linkOk) {
+        g_vOut++;
+        g_vOutBytes += len;
+      } else {
+        g_vDrop++;
+      }
       freeFrame(frame);
     }
 
+    g_clientUp = false;
     close(sock);
     ESP_LOGW(kTag, "lost connection to next, retrying");
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -283,8 +350,31 @@ void clientTask(void * /*arg*/) {
 // and drops them on the same queue as relayed frames.
 // -------------------------------------------------------------------------
 void onLuckfoxFrame(uint8_t stream_id, uint16_t seq, uint8_t *data, uint32_t len) {
+  g_vLocal++;
   FrameHeader hdr{g_nodeId, stream_id, seq, len};
   enqueueOrDrop(new Frame{hdr, data});
+}
+
+// kChainSelfTest only: stands in for the LuckFox so the chain can be tested
+// with nothing but ESP32 boards. One frame per kVideoLocalFrameIntervalMs,
+// rotating through the lanes, payload verifiable at the Gateway.
+void selfTestProducerTask(void * /*arg*/) {
+  uint16_t seq[kVideoStreamsPerNode] = {0};
+  uint8_t stream = 0;
+  while (true) {
+    vTaskDelay(pdMS_TO_TICKS(kVideoLocalFrameIntervalMs));
+    uint8_t *data = allocFrameBuffer(kSelfTestFrameBytes);
+    if (data == nullptr) {
+      g_vDrop++;
+      continue;
+    }
+    uint16_t s = seq[stream]++;
+    for (size_t i = 0; i < kSelfTestFrameBytes; i++) {
+      data[i] = selfTestByte(g_nodeId, stream, s, i);
+    }
+    onLuckfoxFrame(stream, s, data, kSelfTestFrameBytes);
+    stream = static_cast<uint8_t>((stream + 1) % kVideoStreamsPerNode);
+  }
 }
 
 void wifiEventHandler(void * /*arg*/, esp_event_base_t base, int32_t id, void *data) {
@@ -358,13 +448,26 @@ void init(uint8_t nodeId, uint8_t chainSize, bool isGateway) {
   }
 
   xTaskCreate(serverTask, "video_server", 4096, nullptr, 5, nullptr);
-  luckfox_spi::init(onLuckfoxFrame, chain_node::setLaneStatus);
+  if (kChainSelfTest) {
+    ESP_LOGW(kTag, "SELF-TEST MODE: synthetic frames/readings, LuckFox SPI link not started");
+    xTaskCreate(selfTestProducerTask, "video_selftest", 4096, nullptr, 3, nullptr);
+  } else {
+    luckfox_spi::init(onLuckfoxFrame, chain_node::setLaneStatus);
+  }
 
   if (isGateway) {
     ESP_LOGI(kTag, "video_relay up: AP=%s (gateway, sink only)", apSsid);
   } else {
     ESP_LOGI(kTag, "video_relay up: AP=%s -> next=RAP-%u", apSsid, g_nextId);
   }
+}
+
+void logStats() {
+  ESP_LOGI(kTag, "stats: prev=%s next=%s | local=%u in=%u out=%u (%u KB) drop=%u sunk=%u bad=%u | reconnects=%u prev_lost=%u | qlen=%u",
+           g_serverUp ? "up" : "-", g_isGateway ? "n/a" : (g_clientUp ? "up" : "DOWN"), (unsigned)g_vLocal,
+           (unsigned)g_vIn, (unsigned)g_vOut, (unsigned)(g_vOutBytes / 1024), (unsigned)g_vDrop, (unsigned)g_vSunk,
+           (unsigned)g_vBad, (unsigned)g_vReconnects, (unsigned)g_vPrevDrops,
+           (unsigned)(g_outQueue ? uxQueueMessagesWaiting(g_outQueue) : 0));
 }
 
 }  // namespace video_relay

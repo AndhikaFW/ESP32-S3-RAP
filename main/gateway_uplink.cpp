@@ -1,12 +1,17 @@
 #include "gateway_uplink.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 
+#include <fcntl.h>
+
 #include "esp_check.h"
 #include "esp_eth.h"
-#include "esp_eth_enc28j60.h"
+#include "esp_eth_mac_w5500.h"
+#include "esp_eth_phy_w5500.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -32,6 +37,22 @@ constexpr const char *kTag = "gateway_uplink";
 esp_eth_handle_t g_ethHandle = nullptr;
 esp_netif_t *g_netif = nullptr;
 volatile bool g_linkUp = false;
+
+// One StatusPacket's worth of data queued for the status uplink task (see
+// statusUplinkTask()). The chain's main loop only ever enqueues; all the
+// slow/blocking socket work happens on that task.
+struct StatusItem {
+  uint8_t node_id;
+  uint8_t stream_id;
+  uint8_t occupied;
+  char plate[kMaxPlateLen + 1];
+};
+QueueHandle_t g_statusQueue = nullptr;
+
+// Plain counters, written from several tasks and only ever read for the
+// stats line -- a torn/stale read is harmless, so no locking.
+std::atomic<uint32_t> g_stQueued{0}, g_stSent{0}, g_stDropped{0};
+std::atomic<uint32_t> g_vidQueued{0}, g_vidSent{0}, g_vidDropped{0};
 
 // One video frame queued for the Ethernet uplink; owns `data` until it's
 // either sent or dropped (see freeVideoItem()).
@@ -63,6 +84,96 @@ void freeVideoItem(VideoItem *item) {
   if (item == nullptr) return;
   if (item->data != nullptr) heap_caps_free(item->data);
   delete item;
+}
+
+// Bounded connect(): lwIP's blocking connect() can sit for tens of seconds
+// (SYN retries, unresolvable ARP) and SO_SNDTIMEO does not reliably cut it
+// short, so do it non-blocking and select() with an explicit deadline.
+bool connectWithTimeout(int sock, const sockaddr_in &dest, int timeoutMs) {
+  int flags = fcntl(sock, F_GETFL, 0);
+  fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+  int rc = connect(sock, reinterpret_cast<const sockaddr *>(&dest), sizeof(dest));
+  if (rc == 0) {
+    fcntl(sock, F_SETFL, flags);
+    return true;
+  }
+  if (errno != EINPROGRESS) {
+    fcntl(sock, F_SETFL, flags);
+    return false;
+  }
+  fd_set writeSet;
+  FD_ZERO(&writeSet);
+  FD_SET(sock, &writeSet);
+  timeval tv{};
+  tv.tv_sec = timeoutMs / 1000;
+  tv.tv_usec = (timeoutMs % 1000) * 1000;
+  rc = select(sock + 1, nullptr, &writeSet, nullptr, &tv);
+  fcntl(sock, F_SETFL, flags);
+  if (rc <= 0) return false;
+  int sockErr = 0;
+  socklen_t len = sizeof(sockErr);
+  getsockopt(sock, SOL_SOCKET, SO_ERROR, &sockErr, &len);
+  return sockErr == 0;
+}
+
+// Sends queued status readings to the backend, one short TCP connection per
+// reading ("node:stream:occupied:plate\n", see flushOne()). Runs on its own
+// task so the chain's main loop never waits on Ethernet: when the link is
+// down or the backend unreachable, each reading is dropped after at most
+// kStatusConnectTimeoutMs and counted, instead of stalling ESP-NOW handling
+// (which would in turn make `prev` retransmit and back the whole chain up).
+constexpr int kStatusConnectTimeoutMs = 1000;
+
+void flushOne(const StatusItem &item) {
+  int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (sock < 0) {
+    g_stDropped++;
+    return;
+  }
+  sockaddr_in dest{};
+  dest.sin_family = AF_INET;
+  dest.sin_port = htons(kBackendPort);
+  inet_pton(AF_INET, kBackendHost, &dest.sin_addr);
+
+  timeval tv{};
+  tv.tv_sec = 2;
+  setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+  if (!connectWithTimeout(sock, dest, kStatusConnectTimeoutMs)) {
+    close(sock);
+    g_stDropped++;
+    return;
+  }
+
+  // Compact line-oriented payload: "node:stream:occupied:plate\n" -- one
+  // line per reading, sent as soon as it arrives (no more batching by lap).
+  // Swap this for whatever framing the ParkingVision backend expects once
+  // that API is defined -- video/plate-crop images never flow through here,
+  // only this small per-lane text summary.
+  char line[20 + kMaxPlateLen];
+  int written = snprintf(line, sizeof(line), "%u:%u:%u:%s", item.node_id, item.stream_id, item.occupied, item.plate);
+  if (written < static_cast<int>(sizeof(line))) {
+    line[written++] = '\n';
+  }
+  ssize_t sent = send(sock, line, written, 0);
+  close(sock);
+  if (sent == written) {
+    g_stSent++;
+  } else {
+    g_stDropped++;
+  }
+}
+
+void statusUplinkTask(void * /*arg*/) {
+  while (true) {
+    StatusItem item{};
+    if (xQueueReceive(g_statusQueue, &item, portMAX_DELAY) != pdTRUE) continue;
+    if (!g_linkUp) {
+      g_stDropped++;  // nothing to send over; counted, not logged per reading
+      continue;
+    }
+    flushOne(item);
+  }
 }
 
 // Drains g_videoQueue over a UDP socket, one connect() at task start (UDP
@@ -105,6 +216,7 @@ void videoUplinkTask(void * /*arg*/) {
       continue;
     }
     if (!g_linkUp) {
+      g_vidDropped++;
       freeVideoItem(item);
       continue;
     }
@@ -118,6 +230,7 @@ void videoUplinkTask(void * /*arg*/) {
     chunkHdr->seq = item->seq;
     chunkHdr->chunk_count = chunkCount;
 
+    bool sendFailed = false;
     for (uint16_t i = 0; i < chunkCount; i++) {
       size_t offset = static_cast<size_t>(i) * kVideoUdpChunkBytes;
       size_t remaining = static_cast<size_t>(item->data_len) - offset;
@@ -127,8 +240,14 @@ void videoUplinkTask(void * /*arg*/) {
       if (send(sock, chunkBuf, sizeof(VideoChunkHeader) + len, 0) < 0) {
         ESP_LOGW(kTag, "video chunk send failed, dropping rest of node=%u stream=%u seq=%u",
                  item->origin_node_id, item->stream_id, item->seq);
+        sendFailed = true;
         break;
       }
+    }
+    if (sendFailed) {
+      g_vidDropped++;
+    } else {
+      g_vidSent++;
     }
     freeVideoItem(item);
   }
@@ -156,17 +275,19 @@ void ethEventHandler(void *, esp_event_base_t, int32_t eventId, void *eventData)
 }  // namespace
 
 bool init() {
-  // Created unconditionally, before anything ENC28J60-specific that can
-  // fail below: flushVideo() must stay safe to call (it just drops frames
-  // while g_linkUp is false) even if the Ethernet driver never comes up.
+  // Created unconditionally, before anything W5500-specific that can fail
+  // below: flushVideo() must stay safe to call (it just drops frames while
+  // g_linkUp is false) even if the Ethernet driver never comes up.
   g_videoQueue = xQueueCreate(kVideoUplinkQueueDepth, sizeof(VideoItem *));
+  g_statusQueue = xQueueCreate(kStatusUplinkQueueDepth, sizeof(StatusItem));
+  xTaskCreate(statusUplinkTask, "status_uplink", 4096, nullptr, 4, nullptr);
   // 6144, not the old TCP version's 4096 -- videoUplinkTask now keeps a
   // sizeof(VideoChunkHeader)+kVideoUdpChunkBytes (~1.4KB) scratch buffer on
   // its own stack frame for building each outgoing chunk, on top of the
   // usual FreeRTOS/lwIP call-chain overhead the old 4096 was sized for.
   xTaskCreate(videoUplinkTask, "video_uplink", 6144, nullptr, 4, nullptr);
 
-  // Shared ISR service the enc28j60 driver needs for its interrupt GPIO;
+  // Shared ISR service the W5500 driver needs for its interrupt GPIO;
   // ESP_ERR_INVALID_STATE just means something else already installed it.
   esp_err_t isrErr = gpio_install_isr_service(0);
   if (isrErr != ESP_OK && isrErr != ESP_ERR_INVALID_STATE) {
@@ -175,71 +296,72 @@ bool init() {
   }
 
   spi_bus_config_t busCfg{};
-  busCfg.mosi_io_num = kEncMosiPin;
-  busCfg.miso_io_num = kEncMisoPin;
-  busCfg.sclk_io_num = kEncSckPin;
+  busCfg.mosi_io_num = kEthMosiPin;
+  busCfg.miso_io_num = kEthMisoPin;
+  busCfg.sclk_io_num = kEthSckPin;
   busCfg.quadwp_io_num = -1;
   busCfg.quadhd_io_num = -1;
-  if (spi_bus_initialize(kEncSpiHost, &busCfg, SPI_DMA_CH_AUTO) != ESP_OK) {
+  if (spi_bus_initialize(kEthSpiHost, &busCfg, SPI_DMA_CH_AUTO) != ESP_OK) {
     ESP_LOGE(kTag, "spi_bus_initialize failed");
     return false;
   }
 
   spi_device_interface_config_t spiDevCfg{};
   spiDevCfg.mode = 0;
-  spiDevCfg.clock_speed_hz = kEncSpiClockMhz * 1000 * 1000;
+  spiDevCfg.clock_speed_hz = kEthSpiClockMhz * 1000 * 1000;
   spiDevCfg.queue_size = 20;
-  spiDevCfg.spics_io_num = kEncCsPin;
-  spiDevCfg.cs_ena_posttrans = enc28j60_cal_spi_cs_hold_time(kEncSpiClockMhz);
+  spiDevCfg.spics_io_num = kEthCsPin;
 
-  eth_enc28j60_config_t encConfig = ETH_ENC28J60_DEFAULT_CONFIG(kEncSpiHost, &spiDevCfg);
-  encConfig.int_gpio_num = kEncIntPin;
+  eth_w5500_config_t w5500Config = ETH_W5500_DEFAULT_CONFIG(kEthSpiHost, &spiDevCfg);
+  w5500Config.base.int_gpio_num = kEthIntPin;
+  // No separate reset wire in this wiring (5 SPI/INT wires only, same as
+  // the ENC28J60 side had) -- poll_period_ms only matters when
+  // int_gpio_num < 0, which isn't the case here, so this is a no-op;
+  // documented since it's the officially recommended pairing.
+  if (kEthIntPin < 0) {
+    w5500Config.base.poll_period_ms = 10;
+  }
 
   eth_mac_config_t macConfig = ETH_MAC_DEFAULT_CONFIG();
-  esp_eth_mac_t *mac = esp_eth_mac_new_enc28j60(&encConfig, &macConfig);
+  esp_eth_mac_t *mac = esp_eth_mac_new_w5500(&w5500Config, &macConfig);
   if (mac == nullptr) {
-    ESP_LOGE(kTag, "creating ENC28J60 MAC instance failed");
+    ESP_LOGE(kTag, "creating W5500 MAC instance failed");
     return false;
   }
 
   eth_phy_config_t phyConfig = ETH_PHY_DEFAULT_CONFIG();
-  phyConfig.autonego_timeout_ms = 0;  // ENC28J60 doesn't support auto-negotiation
-  phyConfig.reset_gpio_num = -1;      // ENC28J60 has no PHY reset pin
-  esp_eth_phy_t *phy = esp_eth_phy_new_enc28j60(&phyConfig);
+  phyConfig.reset_gpio_num = -1;  // no reset wire in this wiring
+  esp_eth_phy_t *phy = esp_eth_phy_new_w5500(&phyConfig);
   if (phy == nullptr) {
-    ESP_LOGE(kTag, "creating ENC28J60 PHY instance failed");
+    ESP_LOGE(kTag, "creating W5500 PHY instance failed");
     mac->del(mac);
     return false;
   }
 
   esp_eth_config_t ethConfig = ETH_DEFAULT_CONFIG(mac, phy);
   if (esp_eth_driver_install(&ethConfig, &g_ethHandle) != ESP_OK) {
-    ESP_LOGE(kTag, "esp_eth_driver_install failed (no/faulty ENC28J60 on the bus?)");
+    ESP_LOGE(kTag, "esp_eth_driver_install failed (no/faulty W5500 on the bus?)");
     // A failed install can still leave the MAC's interrupt handler attached
-    // to kEncIntPin; without this, a floating INT pin (no chip wired up)
+    // to kEthIntPin; without this, a floating INT pin (no chip wired up)
     // keeps firing into a half-initialized driver and eventually crashes.
     mac->del(mac);
     phy->del(phy);
     return false;
   }
 
-  // ENC28J60 Errata #1: silicon revisions below B5 need >=8MHz SPI clock.
-  // Checked here (not before esp_eth_driver_install above) because
-  // emac_enc28j60_get_chip_info() just returns a struct field that's only
-  // populated by the real SPI chip-ID read inside init() -- calling it any
-  // earlier always sees the zero-initialized default, so the check silently
-  // never passed regardless of the actual chip's revision (caught when
-  // dropping kEncSpiClockMhz below 8 failed this on a confirmed-B7 chip).
-  if (emac_enc28j60_get_chip_info(mac) < ENC28J60_REV_B5 && kEncSpiClockMhz < 8) {
-    ESP_LOGE(kTag, "SPI clock must be >=8MHz for this ENC28J60 silicon revision");
-    esp_eth_driver_uninstall(g_ethHandle);
-    return false;
-  }
-
-  // ENC28J60 has no burned-in MAC; it must be set before any traffic.
-  esp_eth_ioctl(g_ethHandle, ETH_CMD_S_MAC_ADDR, const_cast<uint8_t *>(kEncMac));
-  eth_duplex_t duplex = ETH_DUPLEX_FULL;
-  esp_eth_ioctl(g_ethHandle, ETH_CMD_S_DUPLEX_MODE, &duplex);
+  // Set explicitly regardless of whether this W5500 module has its own
+  // factory MAC (see kEthMac's comment in config.h) -- keeps behavior
+  // deterministic across units rather than depending on that being true.
+  esp_eth_ioctl(g_ethHandle, ETH_CMD_S_MAC_ADDR, const_cast<uint8_t *>(kEthMac));
+  // No explicit duplex-mode ioctl here, unlike the old ENC28J60 code --
+  // that chip "doesn't support auto-negotiation" (see its retired PHY
+  // config comment in git history), so duplex had to be forced manually.
+  // W5500 DOES auto-negotiate, and ETH_PHY_DEFAULT_CONFIG() leaves that
+  // enabled -- forcing ETH_CMD_S_DUPLEX_MODE while autonegotiation is
+  // still active actually fails (confirmed on real hardware: "esp_eth:
+  // esp_eth_ioctl(498): autonegotiation needs to be disabled to change
+  // this parameter"), and there's no reason to override a working
+  // autonegotiation anyway.
 
   esp_netif_config_t netifCfg = ESP_NETIF_DEFAULT_ETH();
   g_netif = esp_netif_new(&netifCfg);
@@ -269,60 +391,40 @@ bool init() {
 }
 
 void flush(uint8_t nodeId, uint8_t streamId, uint8_t occupied, const char *plate) {
-  if (!g_linkUp) {
-    ESP_LOGW(kTag, "link down, dropping reading from node %u stream %u", nodeId, streamId);
-    return;
+  if (g_statusQueue == nullptr) {
+    return;  // not initialised (relay node, or init() not reached yet)
   }
-
-  int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if (sock < 0) {
-    ESP_LOGW(kTag, "socket() failed, dropping reading from node %u stream %u", nodeId, streamId);
-    return;
+  StatusItem item{};
+  item.node_id = nodeId;
+  item.stream_id = streamId;
+  item.occupied = occupied;
+  strncpy(item.plate, plate, kMaxPlateLen);
+  item.plate[kMaxPlateLen] = '\0';
+  if (xQueueSend(g_statusQueue, &item, 0) == pdTRUE) {
+    g_stQueued++;
+  } else {
+    g_stDropped++;  // uplink task is behind; the chain must not wait for it
   }
+}
 
-  sockaddr_in dest{};
-  dest.sin_family = AF_INET;
-  dest.sin_port = htons(kBackendPort);
-  inet_pton(AF_INET, kBackendHost, &dest.sin_addr);
-
-  // 2s connect/send budget so a dead backend never stalls the chain.
-  timeval tv{};
-  tv.tv_sec = 2;
-  tv.tv_usec = 0;
-  setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-  if (connect(sock, reinterpret_cast<sockaddr *>(&dest), sizeof(dest)) != 0) {
-    ESP_LOGW(kTag, "connect to %s:%u failed, dropping reading from node %u stream %u", kBackendHost,
-              kBackendPort, nodeId, streamId);
-    close(sock);
-    return;
-  }
-
-  // Compact line-oriented payload: "node:stream:occupied:plate\n" -- one
-  // line per reading, sent as soon as it arrives (no more batching by lap).
-  // Swap this for whatever framing the ParkingVision backend expects once
-  // that API is defined -- video/plate-crop images never flow through here,
-  // only this small per-lane text summary.
-  char line[20 + kMaxPlateLen];
-  int written = snprintf(line, sizeof(line), "%u:%u:%u:%s", nodeId, streamId, occupied, plate);
-  if (written < static_cast<int>(sizeof(line))) {
-    line[written++] = '\n';
-  }
-
-  send(sock, line, written, 0);
-  close(sock);
+void logStats() {
+  ESP_LOGI(kTag, "stats: link=%s | status queued=%u sent=%u dropped=%u | video queued=%u sent=%u dropped=%u",
+           g_linkUp ? "up" : "DOWN", (unsigned)g_stQueued, (unsigned)g_stSent, (unsigned)g_stDropped,
+           (unsigned)g_vidQueued, (unsigned)g_vidSent, (unsigned)g_vidDropped);
 }
 
 void flushVideo(uint8_t originNodeId, uint8_t streamId, uint16_t seq, uint8_t *data, uint32_t dataLen) {
   if (g_videoQueue == nullptr || !g_linkUp) {
+    g_vidDropped++;
     heap_caps_free(data);
     return;
   }
   auto *item = new VideoItem{originNodeId, streamId, seq, dataLen, data};
   if (xQueueSend(g_videoQueue, &item, 0) != pdTRUE) {
-    ESP_LOGW(kTag, "video uplink queue full, dropping node=%u stream=%u", originNodeId, streamId);
+    g_vidDropped++;  // counted in logStats(), not logged per frame
     freeVideoItem(item);
+  } else {
+    g_vidQueued++;
   }
 }
 

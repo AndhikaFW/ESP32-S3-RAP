@@ -1,5 +1,6 @@
 #include "chain_node.h"
 
+#include <cstdio>
 #include <cstring>
 
 #include "esp_log.h"
@@ -62,6 +63,25 @@ uint8_t g_retryCount = 0;
 
 uint32_t nowMs() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
 
+// Health counters for logStats(). Written only from loop()'s task, so plain
+// integers are fine.
+uint32_t g_statLocal = 0;       // readings this node originated
+uint32_t g_statIn = 0;          // packets accepted from prev
+uint32_t g_statForwarded = 0;   // packets next has ACKed (relay) -- 0 on the Gateway
+uint32_t g_statSunk = 0;        // packets handed to the Ethernet uplink (Gateway only)
+uint32_t g_statRetx = 0;        // retransmissions to next
+uint32_t g_statQueueDrops = 0;  // readings/packets dropped because the out queue was full
+uint32_t g_lastRetryWarnMs = 0;
+
+const char *stateName(State s) {
+  switch (s) {
+    case State::kDiscovering: return "DISCOVERING";
+    case State::kIdle: return "IDLE";
+    case State::kForwarding: return "FORWARDING";
+  }
+  return "?";
+}
+
 bool macEquals(const uint8_t *a, const uint8_t *b) { return memcmp(a, b, 6) == 0; }
 
 // Latest reading per lane, pushed by setLaneStatus() (wired up as
@@ -77,6 +97,18 @@ char g_lanePlate[kVideoStreamsPerNode][kMaxPlateLen + 1] = {{0}};
 // local-origination timer in loop() rotates through all of them round-robin
 // instead of a single reading per node.
 void readLocalStatus(uint8_t streamId, uint8_t *occupied, char plate[kMaxPlateLen + 1]) {
+  if (kChainSelfTest) {
+    // Synthetic reading (no LuckFox needed): each lane flips occupancy every
+    // 10 s, offset by node and lane so lanes don't all flip together.
+    bool occ = (((nowMs() / 10000) + g_nodeId + streamId) & 1) != 0;
+    *occupied = occ ? 1 : 0;
+    if (occ) {
+      snprintf(plate, kMaxPlateLen + 1, "T%uL%u", g_nodeId, streamId);
+    } else {
+      plate[0] = '\0';
+    }
+    return;
+  }
   *occupied = g_laneOccupied[streamId];
   strncpy(plate, g_lanePlate[streamId], kMaxPlateLen);
   plate[kMaxPlateLen] = '\0';
@@ -152,6 +184,8 @@ void handleStatus(const uint8_t *mac, const StatusPacket &pkt) {
     g_lastAcceptedOrigin = pkt.origin_node_id;
     g_lastAcceptedSeq = pkt.seq;
     sendAck(g_prevMac, pkt.origin_node_id, pkt.seq);
+    g_statIn++;
+    g_statSunk++;
     gateway_uplink::flush(pkt.origin_node_id, pkt.stream_id, pkt.occupied, pkt.plate);
     return;
   }
@@ -160,8 +194,10 @@ void handleStatus(const uint8_t *mac, const StatusPacket &pkt) {
   // forwarding. If the queue's full we just don't ack -- prev retries after
   // its timeout, which is the backpressure signal that this hop is behind.
   if (xQueueSend(g_outQueue, &pkt, 0) != pdTRUE) {
+    g_statQueueDrops++;
     return;
   }
+  g_statIn++;
   g_hasAcceptedAny = true;
   g_lastAcceptedOrigin = pkt.origin_node_id;
   g_lastAcceptedSeq = pkt.seq;
@@ -177,6 +213,7 @@ void handleAck(const uint8_t *mac, const AckPacket &ack) {
   }
   g_state = State::kIdle;
   g_retryCount = 0;
+  g_statForwarded++;
 }
 
 void onEspNowRecv(const uint8_t mac[6], const uint8_t *data, size_t len) {
@@ -256,10 +293,12 @@ void loop() {
     pkt.seq = g_localSeq++;
     readLocalStatus(g_localStream, &pkt.occupied, pkt.plate);
     g_localStream = static_cast<uint8_t>((g_localStream + 1) % kVideoStreamsPerNode);
+    g_statLocal++;
     if (g_isGateway) {
+      g_statSunk++;
       gateway_uplink::flush(pkt.origin_node_id, pkt.stream_id, pkt.occupied, pkt.plate);
     } else if (xQueueSend(g_outQueue, &pkt, 0) != pdTRUE) {
-      ESP_LOGW(kTag, "out queue full, dropping local reading");
+      g_statQueueDrops++;  // visible in logStats(); per-reading logging would flood a stalled hop
     }
   }
 
@@ -270,7 +309,10 @@ void loop() {
   if (g_state == State::kForwarding) {
     if (nowMs() >= g_ackDeadlineMs) {
       g_retryCount++;
-      if (g_retryCount > kMaxRetransmit) {
+      g_statRetx++;
+      if (g_retryCount > kMaxRetransmit && nowMs() - g_lastRetryWarnMs >= 5000) {
+        // Rate-limited: a dead `next` would otherwise log every kAckTimeoutMs.
+        g_lastRetryWarnMs = nowMs();
         ESP_LOGW(kTag, "no ACK from next after %u retries (origin=%u seq=%u)", g_retryCount,
                   g_pending.origin_node_id, g_pending.seq);
         // Keep retrying at the same cadence -- there is no self-healing
@@ -285,6 +327,19 @@ void loop() {
   StatusPacket next;
   if (xQueueReceive(g_outQueue, &next, 0) == pdTRUE) {
     beginForwarding(next);
+  }
+}
+
+void logStats() {
+  if (g_isGateway) {
+    ESP_LOGI(kTag, "stats: node=%u/%u GATEWAY state=%s prev=%s | local=%u in=%u sunk=%u",
+             g_nodeId, g_chainSize, stateName(g_state), g_prevKnown ? "ok" : "-", (unsigned)g_statLocal,
+             (unsigned)g_statIn, (unsigned)g_statSunk);
+  } else {
+    ESP_LOGI(kTag, "stats: node=%u/%u RELAY state=%s prev=%s next=%s | local=%u in=%u fwd=%u retx=%u qdrop=%u qlen=%u",
+             g_nodeId, g_chainSize, stateName(g_state), g_prevKnown ? "ok" : "-", g_nextKnown ? "ok" : "-",
+             (unsigned)g_statLocal, (unsigned)g_statIn, (unsigned)g_statForwarded, (unsigned)g_statRetx,
+             (unsigned)g_statQueueDrops, (unsigned)(g_outQueue ? uxQueueMessagesWaiting(g_outQueue) : 0));
   }
 }
 

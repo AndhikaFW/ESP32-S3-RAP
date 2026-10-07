@@ -5,7 +5,7 @@
 
 #include "driver/spi_master.h"
 
-// Node with this id is always the chain's Gateway (has the ENC28J60/RJ45
+// Node with this id is always the chain's Gateway (has the W5500/RJ45
 // uplink) -- still a parking-lot node like any other, just the one with this
 // extra role. All other ids 1..(chain_size-1) are plain relay nodes (also
 // parking lots). Every node runs this same firmware image; role is decided
@@ -45,38 +45,50 @@ constexpr const char *kNvsKeyNodeId = "node_id";
 constexpr const char *kNvsKeyChainSize = "chain_size";
 constexpr uint8_t kUnprovisioned = 0xFF;
 
-// -- ENC28J60 SPI wiring (Gateway node only) --
+// -- W5500 SPI wiring (Gateway node only) --
+//
+// Swapped from an ENC28J60 module to a W5500 module on the same Gateway
+// unit (on request) -- the ENC28J60 breadboard module was suspected
+// faulty (see the retired kEncSpiClockMhz troubleshooting note in git
+// history: intermittent tx_ready_sem timeouts, unaffected by SPI clock,
+// pointing at the module's own magnetics/RJ45 circuit rather than a
+// timing/code issue). Pin assignments below are UNCHANGED from the
+// ENC28J60 wiring -- same 5 wires reused (CS/SCK/MOSI/MISO/INT), on the
+// assumption the physical swap reused the same breadboard connections; if
+// the link doesn't come up, check that assumption first.
 //
 // SPI3_HOST here (not SPI2_HOST) -- see the LuckFox SPI link section below
 // for why: ESP32-S3 only has one SPI controller with a dedicated IOMUX fast
 // path (SPI2_HOST, pins GPIO10/11/12/13), and the LuckFox link needs it far
 // more (it's the SPI *slave*, which is unreliable on the GPIO-matrix-routed
-// host). ENC28J60 is master-only here and tolerates the GPIO matrix's extra
+// host). W5500 is master-only here and tolerates the GPIO matrix's extra
 // routing delay fine, so it gives up the IOMUX pins in this swap. On the
 // real shield PCB this is moot (both are fixed traces); on a dev-board
-// breadboard, rewire ENC28J60's 4 SPI wires to GPIO4/5/6/7 (CS/SCK/MOSI/MISO
+// breadboard, wire W5500's 4 SPI wires to GPIO4/5/6/7 (CS/SCK/MOSI/MISO
 // respectively) to match.
-constexpr spi_host_device_t kEncSpiHost = SPI3_HOST;
-// Tried lowering this to 2MHz to chase intermittent tx_ready_sem timeouts
-// (packets never finishing transmission) on the breadboard rig -- made no
-// difference (identical failure at 2MHz and 8MHz), so the timeout isn't an
-// SPI signal-integrity issue; back to 8MHz since this chip's silicon
-// revision (B7) is rated for it. See docs/network/enc28j60_wiring.dot --
-// the actual cause looks like the breadboard ENC28J60 module itself
-// (no proper magnetics/RJ45 circuit).
-constexpr int kEncSpiClockMhz = 8;
-constexpr int kEncCsPin = 7;
-constexpr int kEncSckPin = 6;
-constexpr int kEncMisoPin = 5;
-constexpr int kEncMosiPin = 4;
-constexpr int kEncIntPin = 9;
+constexpr spi_host_device_t kEthSpiHost = SPI3_HOST;
+// Kept at the same 8MHz the ENC28J60 side was already proven stable at on
+// this wiring, on request (swap one variable -- the chip -- at a time
+// rather than also changing SPI clock in the same test). W5500 is rated up
+// to 80MHz per its datasheet, so there's real headroom to raise this later
+// once the chip swap itself is confirmed to fix the link, but that's a
+// separate change, not bundled into this one.
+constexpr int kEthSpiClockMhz = 8;
+constexpr int kEthCsPin = 7;
+constexpr int kEthSckPin = 6;
+constexpr int kEthMisoPin = 5;
+constexpr int kEthMosiPin = 4;
+constexpr int kEthIntPin = 9;
 
-// Locally-administered MAC for the ENC28J60 side; only needs to be unique on
-// the LAN segment the gateway's RJ45 plugs into (ENC28J60 has no burned-in
-// MAC of its own).
-constexpr uint8_t kEncMac[6] = {0x02, 0x52, 0x41, 0x50, 0x00, 0x01};
+// Locally-administered MAC for the Ethernet side; only needs to be unique
+// on the LAN segment the gateway's RJ45 plugs into. Set explicitly here
+// regardless of whether this particular W5500 module has its own
+// factory-programmed MAC (WIZnet's own W5500 datasheet doesn't guarantee
+// one on the bare chip; some breakout boards add a separate MAC EEPROM,
+// some don't) -- explicit beats relying on that being true for this unit.
+constexpr uint8_t kEthMac[6] = {0x02, 0x52, 0x41, 0x50, 0x00, 0x01};
 
-// -- Gateway <-> Raspberry Pi 4 Ethernet link (ENC28J60 RJ45 -> RPi4 eth0) --
+// -- Gateway <-> Raspberry Pi 4 Ethernet link (W5500 RJ45 -> RPi4 eth0) --
 //
 // Direct cable, no switch/router/DHCP server in between, so both ends use
 // static IPs instead of DHCP. RPi4's eth0 is otherwise unused (its own LAN/
@@ -151,15 +163,45 @@ constexpr uint8_t kPlateStreamBase = kVideoStreamsPerNode;
 // worst-case yet.
 constexpr size_t kVideoMaxFrameBytes = 256 * 1024;
 constexpr size_t kVideoQueueDepth = 12;                 // frames buffered in PSRAM, in flight to next
-constexpr uint32_t kVideoLocalFrameIntervalMs = 300;    // placeholder producer cadence, see video_relay.cpp
+constexpr uint32_t kVideoLocalFrameIntervalMs = 300;    // cadence of the self-test frame producer (kChainSelfTest only)
+
+// -- Chain robustness / observability --
+//
+// How often every node logs a one-line health summary (chain, video, uplink,
+// heap). The only way to see a chain's state without a debugger, so it stays
+// on in production; it is a handful of lines per interval, not per packet.
+constexpr uint32_t kStatsLogIntervalMs = 10000;
+// Gateway only: StatusPackets buffered for the (separate) uplink task. The
+// chain itself never waits on the Ethernet side -- if the uplink is slow or
+// down, readings are dropped here, counted, and logged in the stats line.
+constexpr size_t kStatusUplinkQueueDepth = 32;
+// Video hop keepalive. A relay sends a zero-length "heartbeat" header
+// (stream_id == kVideoHeartbeatStream) whenever it has had nothing to send
+// for kVideoHeartbeatMs; the receiving side drops the connection if it hears
+// nothing at all for kVideoRecvTimeoutMs. Without this a relay that resets
+// leaves its old TCP connection half-open on the receiver (no FIN is ever
+// sent), the receiver's blocking recv() never returns, and the restarted
+// relay's new connection is never accepted -- the video hop stays dead until
+// the receiver itself is rebooted.
+constexpr uint32_t kVideoHeartbeatMs = 2000;
+constexpr uint32_t kVideoRecvTimeoutMs = 7000;
+constexpr uint8_t kVideoHeartbeatStream = 0xFF;
+// Chain self-test (OFF in production). When true, every node synthesizes its
+// own lane readings and video frames instead of waiting for a LuckFox on the
+// SPI link, and the Gateway verifies every video frame's payload as it
+// arrives (counted as "bad" in the stats line). Lets the whole WiFi chain be
+// exercised with nothing but ESP32 boards.
+constexpr bool kChainSelfTest = false;
+constexpr size_t kSelfTestFrameBytes = 8000;
 
 // -- LuckFox <-> ESP32 SPI link (every node, not just the Gateway) --
 //
 // ESP32-S3 is the SPI *slave* here (driver/spi_slave.h) -- LuckFox's Linux
 // side already owns /dev/spidev0.0 in master mode (enabled via
 // `luckfox-config`'s SPI0 M0 overlay; Linux spidev is master-only, and this
-// firmware already uses spi_master.h for the Gateway's ENC28J60, so LuckFox
-// stays master and ESP32 is the slave here to avoid a two-master bus).
+// firmware already uses spi_master.h for the Gateway's Ethernet chip
+// (ENC28J60, now W5500), so LuckFox stays master and ESP32 is the slave
+// here to avoid a two-master bus).
 //
 // SPI2_HOST specifically (not SPI3_HOST) -- ESP32-S3 only gives ONE SPI
 // controller a dedicated IOMUX fast path (SPI2_HOST: CS0=GPIO10, SCK=GPIO12,
@@ -169,12 +211,14 @@ constexpr uint32_t kVideoLocalFrameIntervalMs = 300;    // placeholder producer 
 // delay), but ESP-IDF's SPI *slave* driver needs to sample an externally-
 // generated clock and is known to be unreliable -- transactions can fail to
 // complete at all, regardless of clock speed -- when routed through the GPIO
-// matrix instead of IOMUX. Root-caused after the ENC28J60 (a master) sat on
-// these same IOMUX pins and worked fine there while the LuckFox slave link
-// on arbitrary GPIO4/5/6/7 (GPIO-matrix-routed) never completed a single
-// transaction despite every other layer (wiring, LuckFox-side spidev
-// loopback, this firmware's own GPIO-level loopback) checking out perfectly.
-// See ENC28J60 section above for its swapped-out pins.
+// matrix instead of IOMUX. Root-caused after the ENC28J60 (a master, since
+// swapped for a W5500 -- same reasoning applies to either chip, this is
+// about master-vs-slave GPIO routing, not anything ENC28J60-specific) sat
+// on these same IOMUX pins and worked fine there while the LuckFox slave
+// link on arbitrary GPIO4/5/6/7 (GPIO-matrix-routed) never completed a
+// single transaction despite every other layer (wiring, LuckFox-side
+// spidev loopback, this firmware's own GPIO-level loopback) checking out
+// perfectly. See W5500 section above for its swapped-out pins.
 constexpr spi_host_device_t kLuckfoxSpiHost = SPI2_HOST;
 constexpr int kLuckfoxSpiMosiPin = 11;
 constexpr int kLuckfoxSpiMisoPin = 13;

@@ -4,14 +4,14 @@
 
 - **N** node ESP32-S3 tersusun sebagai **chain** (bukan ring tertutup), saling terhubung secara **logis** lewat **ESP-NOW** (unicast ke MAC address tetangga, tanpa router/AP).
 - **Tidak ada "node pertama"**: setiap node punya inisiatif sendiri untuk membuat dan mengirim data (`StatusPacket`) ke `next`-nya, dengan jadwal masing-masing (`kStatusLocalIntervalMs`). Data mengalir **searah**: tiap node hanya mengirim ke `next` dan hanya menerima dari `prev`.
-- Tepat **satu node istimewa = Gateway**, yang tambahan punya modul **ENC28J60** (Ethernet SPI) ke **RJ45**. Semua node lain adalah **Relay Node** biasa.
-- **Gateway tidak punya `next` sama sekali** — ia bukan bagian dari jalur relay chain, hanya **sink**: setiap `StatusPacket`/frame video yang sampai ke Gateway (dari `prev`-nya, atau dibuatnya sendiri) langsung di-flush ke ENC28J60 → RJ45 → RPi4, tidak pernah dibuat ulang/dikirim balik ke chain. Ini beda dari desain awal (single token yang berputar terus) — lihat poin 5.
+- Tepat **satu node istimewa = Gateway**, yang tambahan punya modul **W5500** (Ethernet SPI) ke **RJ45**. Semua node lain adalah **Relay Node** biasa.
+- **Gateway tidak punya `next` sama sekali** — ia bukan bagian dari jalur relay chain, hanya **sink**: setiap `StatusPacket`/frame video yang sampai ke Gateway (dari `prev`-nya, atau dibuatnya sendiri) langsung di-flush ke W5500 → RJ45 → RPi4, tidak pernah dibuat ulang/dikirim balik ke chain. Ini beda dari desain awal (single token yang berputar terus) — lihat poin 5.
 
 Nomor "next"/"prev" tiap node tetap dihitung modulo `chain_size` (`next = (id+1)%N`, `prev = (id-1+N)%N`) supaya auto-discovery (poin 6) tetap sederhana, tapi secara **fungsional** ini bukan lingkaran: rantai relay sebenarnya cuma `Node 1 -> Node 2 -> ... -> Node N-1 -> Node 0 (Gateway)`. Node 1 memang punya `prev = Node 0` untuk keperluan HELLO/discovery, tapi Gateway tidak pernah mengirim `StatusPacket`/video ke situ — link itu cuma dipakai untuk saling kenal MAC address, tidak pernah membawa data.
 
 ## 2. Diagram Topologi
 
-![Topologi chain ESP32-S3 dengan ESP-NOW dan gateway ENC28J60/RJ45](topology.png)
+![Topologi chain ESP32-S3 dengan ESP-NOW dan gateway W5500/RJ45](topology.png)
 
 Sumber diagram: `topology.dot` (Graphviz, layout `circo`) di folder yang sama — regenerate dengan:
 
@@ -24,7 +24,7 @@ dot -Tsvg topology.dot -o topology.svg
 - Panah solid biru tebal: arah aliran **DATA** (`StatusPacket`/video, searah chain, satu arah tetap).
 - Panah putus-putus abu-abu: **ACK** (sinyal "buffer sudah dihapus/boleh kirim lagi"), mengalir berlawanan arah data, **hanya sebagai kontrol alir per-hop**.
 - Panah titik-titik abu-abu (Node 0 -> Node 1): **HELLO saja** untuk keperluan auto-discovery (poin 6) — Gateway tidak pernah kirim DATA ke situ.
-- Panah oranye: satu-satunya link keluar chain, dari Gateway ke RPi4 lewat ENC28J60/RJ45 (dua port: status/plat dan video).
+- Panah oranye: satu-satunya link keluar chain, dari Gateway ke RPi4 lewat W5500/RJ45 (dua port: status/plat dan video).
 
 ### ASCII fallback (kalau gambar tidak ter-render)
 
@@ -39,7 +39,7 @@ dot -Tsvg topology.dot -o topology.svg
                                                                    │  Node 0   │
                                                                    │ (GATEWAY) │
                                                                    └─────┬─────┘
-                                                                         │ RJ45 (ENC28J60, SPI)
+                                                                         │ RJ45 (W5500, SPI)
                                                                          ▼
                                                                   [ RPi4 backend ]
 ```
@@ -80,7 +80,7 @@ stateDiagram-v2
     [*] --> WaitEvent
     WaitEvent --> RecvFromChain: StatusPacket/video frame diterima dari Node N-1
     RecvFromChain --> AckUpstream: kirim ACK ke Node N-1 (selalu, tidak pernah backpressure)
-    AckUpstream --> FlushEth: flush ke ENC28J60 -> RJ45 -> RPi4 (status:5000 / video:5300)
+    AckUpstream --> FlushEth: flush ke W5500 -> RJ45 -> RPi4 (status:5000 / video:5300)
     FlushEth --> WaitEvent
     WaitEvent --> LocalTimerFires: timer lokal Gateway sendiri (kStatusLocalIntervalMs / kVideoLocalFrameIntervalMs)
     LocalTimerFires --> FlushEth: bikin StatusPacket/frame sendiri, flush langsung (tanpa lewat chain sama sekali)
@@ -121,7 +121,7 @@ MAC address `next`/`prev` neighbor **tidak di-hardcode saat compile** — setiap
 
 | Role | Jumlah | Tugas | Hardware tambahan |
 |---|---|---|---|
-| `GATEWAY` | 1 (Node 0) | Terima `StatusPacket`/video dari `prev` → flush ke RJ45. Buat `StatusPacket`/video sendiri → flush langsung (tanpa lewat chain). Tidak punya `next`. | ENC28J60 (SPI) |
+| `GATEWAY` | 1 (Node 0) | Terima `StatusPacket`/video dari `prev` → flush ke RJ45. Buat `StatusPacket`/video sendiri → flush langsung (tanpa lewat chain). Tidak punya `next`. | W5500 (SPI) |
 | `RELAY`   | N-1 | Buat `StatusPacket`/video sendiri secara independen + relay yang diterima dari `prev`, keduanya diselang-seling lewat satu antrian ke `next`, tunduk stop-and-wait | - |
 
 Konfigurasi per node hanya butuh dua nilai (provisioning sekali via console UART, tersimpan di NVS):
@@ -141,33 +141,35 @@ Firmware ada di root repo ini, **ESP-IDF native** (bukan Arduino/PlatformIO):
 - `main/provisioning.*` — baca `node_id`/`chain_size` dari NVS (`nvs.h` native), atau prompt di console UART (`SETID <id> <chain_size>`) kalau belum diprovisioning.
 - `main/chain_node.*` — state machine inti: discovery (poin 6) + chain hop-by-hop dengan stop-and-wait per-hop (poin 3) + tiap node originate `StatusPacket` sendiri (poin 5). Gateway tidak forward, cuma sink.
 - `main/video_relay.*` — jalur video terpisah (WiFi AP+STA daisy-chain + TCP di `kVideoPort`, di luar ESP-NOW): tiap node SoftAP untuk `prev`, STA ke `next`'s AP. Frame dibungkus `FrameHeader{origin_node_id, stream_id, seq, data_len}`. Buffer PSRAM dengan fallback ke internal heap kalau PSRAM tidak tersedia.
-- `main/gateway_uplink.*` — bring-up ENC28J60 lewat komponen resmi `espressif/enc28j60` (esp_eth MAC/PHY driver, IP statis) + dua jalur kirim ke RPi4: `flush()` (satu baris teks `node:occupied:plate` per pembacaan, `kBackendPort` 5000, connect-per-kirim) dan `flushVideo()` (frame biner dengan header yang sama seperti `FrameHeader`, `kVideoBackendPort` 5300, koneksi TCP persisten lewat task tersendiri).
+- `main/gateway_uplink.*` — bring-up W5500 lewat komponen resmi `espressif/w5500` (esp_eth MAC/PHY driver, IP statis) + dua jalur kirim ke RPi4: `flush()` (satu baris teks `node:occupied:plate` per pembacaan, `kBackendPort` 5000, connect-per-kirim) dan `flushVideo()` (frame biner dengan header yang sama seperti `FrameHeader`, `kVideoBackendPort` 5300, koneksi TCP persisten lewat task tersendiri).
 - `main/main.cpp` — `app_main`: NVS init, WiFi/ESP-NOW/AP+STA netif init, Ethernet init (kalau Gateway), lalu loop chain.
 
 Ini submodule firmware ESP32-S3 saja. Demo listener sisi RPi4 (`status_listener.py`, `video_listener.py`, `node_names.json`) ada di `backend/` pada **parent repo**, di luar submodule ini -- lihat root `README.md`.
 
 Lihat `README.md` (root submodule ini) untuk cara build, flash (termasuk catatan port USB mana yang auto-reset tanpa tombol), dan provisioning tiap node.
 
-## 9. Wiring ENC28J60 <-> ESP32-S3 Gateway <-> RPi4
+## 9. Wiring W5500 <-> ESP32-S3 Gateway <-> RPi4
 
-![Wiring ENC28J60, ESP32-S3 Gateway, dan RPi4 eth0](enc28j60_wiring.png)
+Diganti dari ENC28J60 ke W5500 (atas permintaan) -- pin sama persis, cuma modul SPI Ethernet-nya yang diganti. Diuji nyata di hardware: link up bersih (tanpa retry/error berulang seperti ENC28J60 dulu), IP statis langsung didapat, ping ke RPi4 0% packet loss.
 
-Sumber: `enc28j60_wiring.dot` di folder yang sama, regenerate dengan `dot -Tpng -Gdpi=150 enc28j60_wiring.dot -o enc28j60_wiring.png`.
+![Wiring W5500, ESP32-S3 Gateway, dan RPi4 eth0](w5500_wiring.png)
 
-Pin SPI (lihat `main/config.h`, `SPI2_HOST` @ 8MHz):
+Sumber: `w5500_wiring.dot` di folder yang sama, regenerate dengan `dot -Tpng -Gdpi=150 w5500_wiring.dot -o w5500_wiring.png`.
 
-| ENC28J60 | ESP32-S3 (Gateway) |
+Pin SPI (lihat `main/config.h`, `SPI3_HOST` @ 8MHz -- **bukan** `SPI2_HOST`, itu pin LuckFox di bagian lain dokumen ini):
+
+| W5500 | ESP32-S3 (Gateway) |
 |---|---|
-| CS | GPIO10 |
-| SCK | GPIO12 |
-| SI (MOSI) | GPIO11 |
-| SO (MISO) | GPIO13 |
-| INT | GPIO9 |
+| CS | GPIO7 (`kEthCsPin`) |
+| SCK | GPIO6 (`kEthSckPin`) |
+| MOSI | GPIO4 (`kEthMosiPin`) |
+| MISO | GPIO5 (`kEthMisoPin`) |
+| INT | GPIO9 (`kEthIntPin`) |
 | VCC | 3V3 |
 | GND | GND |
 | RST | tidak dipakai (`phyConfig.reset_gpio_num = -1`) |
 
-**RJ45 ENC28J60 disambung kabel langsung ke `eth0` RPi4** (bukan lewat switch/router). Karena link langsung tidak ada DHCP server, kedua sisi pakai **IP statis**:
+**RJ45 W5500 disambung kabel langsung ke `eth0` RPi4** (bukan lewat switch/router). Karena link langsung tidak ada DHCP server, kedua sisi pakai **IP statis**:
 
 - ESP32-S3 Gateway: `192.168.50.2/24` (`kEthStaticIp` di `config.h`)
 - RPi4 `eth0`: `192.168.50.1/24`, di-set sekali via:
@@ -175,9 +177,18 @@ Pin SPI (lihat `main/config.h`, `SPI2_HOST` @ 8MHz):
   sudo nmcli connection modify "Wired connection 1" ipv4.method manual ipv4.addresses 192.168.50.1/24
   sudo nmcli connection up "Wired connection 1"
   ```
-- `kBackendHost` di `config.h` otomatis mengikuti `kEthStaticGateway` (192.168.50.1). `gateway_uplink::flush()` mengirim tiap pembacaan status/plat ke `kBackendHost:kBackendPort` (5000, connect-per-kirim), `gateway_uplink::flushVideo()` mengirim tiap frame video ke `kBackendHost:kVideoBackendPort` (5300, koneksi persisten).
+- `kBackendHost` di `config.h` otomatis mengikuti `kEthStaticGateway` (192.168.50.1). `gateway_uplink::flush()` mengirim tiap pembacaan status/plat ke `kBackendHost:kBackendPort` (5000, TCP, connect-per-kirim), `gateway_uplink::flushVideo()` mengirim tiap frame video (dipecah jadi chunk, lihat `kVideoUdpChunkBytes`) ke `kBackendHost:kVideoBackendPort` (5300, **UDP**, satu socket dipakai terus -- lihat "Switch video uplink to UDP chunking" di git history untuk alasan TCP->UDP).
 
 RPi4 `eth0` tidak dipakai untuk apa pun selain link ini (koneksi LAN/internet RPi4 tetap lewat `wlan0`), jadi aman dipakai eksklusif untuk Gateway.
+
+### Ketahanan, statistik, dan self-test
+
+- **Heartbeat video**: saat idle, client `video_relay` mengirim header kosong (`stream_id=0xFF`, `data_len=0`) tiap `kVideoHeartbeatMs` (2 s). Server menutup koneksi kalau tidak ada data sama sekali selama `kVideoRecvTimeoutMs` (7 s), lalu menunggu `prev` tersambung ulang. Client reconnect otomatis.
+- **Uplink status** di Gateway lewat antrean (`kStatusUplinkQueueDepth`) dan task sendiri dengan connect non-blocking (timeout 1 s), jadi uplink yang bermasalah tidak memblokir chain ESP-NOW.
+- **Statistik** dicatat tiap `kStatsLogIntervalMs` (10 s): `chain_node` (local/in/fwd/retx/qdrop), `video_relay` (in/out/sunk/drop/bad/reconnects/prev_lost), `gateway_uplink` (queued/sent/dropped), plus heap, PSRAM, uptime.
+- **Self-test** (`kChainSelfTest` di `config.h`, default `false`): node membuat pembacaan dan frame video sintetis tanpa LuckFox. Isi frame diverifikasi byte per byte di sink Gateway (`bad` harus 0). Hasil uji 2 node: discovery ~5 s, status tanpa retransmisi, video tanpa frame rusak, pulih ~4 s setelah node 1 di-reset.
+- **Unit tanpa PSRAM** (satu board gagal uji PSRAM saat boot): build dengan `sdkconfig.nopsram.defaults`. Chain tidak butuh PSRAM.
+- **Link LuckFox ke ESP32 (SPI)** teruji dengan muatan sintetis di dua pasangan (status dan frame 8 KB, 4 MHz). Kamera dan encoder asli belum diuji, begitu juga uplink W5500 ke RPi (modul masih menghasilkan frame TX korup).
 
 ### Belum diimplementasikan / TODO
 

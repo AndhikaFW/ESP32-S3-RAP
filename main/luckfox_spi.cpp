@@ -6,6 +6,7 @@
 #include "driver/spi_slave.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -87,7 +88,9 @@ bool transactOnce() {
 }
 
 void receiverTask(void * /*arg*/) {
-  uint32_t diagCount = 0;
+  uint32_t diagCount = 0;    // non-header transactions since the last summary line
+  uint32_t noSyncRun = 0;    // consecutive non-header transactions
+  int64_t lastDiagUs = 0;
   while (true) {
     // -- Wait for a valid header transaction --
     WireHeader hdr{};
@@ -97,20 +100,35 @@ void receiverTask(void * /*arg*/) {
         continue;
       }
       memcpy(&hdr, g_rxScratch, sizeof(hdr));
-      if (hdr.magic == kMagic) break;
+      if (hdr.magic == kMagic) {
+        noSyncRun = 0;
+        break;
+      }
       // Not a header (or we're out of sync with the sender) -- keep
       // consuming transactions until one lines up. LuckFox retries the
       // whole frame on timeout (see luckfox/spi_sender.py), so this
       // self-heals.
       //
-      // DIAGNOSTIC (temporary, see project notes on the SPI bring-up):
-      // log every 200th non-matching transaction's first bytes so we can
-      // tell "receiving nothing" (all zero) apart from "receiving garbage
-      // out of sync" (non-zero, wrong magic) from the serial capture.
-      if ((diagCount++ % 200) == 0) {
-        ESP_LOGI(kTag, "no-sync #%u: %02x %02x %02x %02x %02x %02x %02x %02x", (unsigned)diagCount,
-                 g_rxScratch[0], g_rxScratch[1], g_rxScratch[2], g_rxScratch[3], g_rxScratch[4],
-                 g_rxScratch[5], g_rxScratch[6], g_rxScratch[7]);
+      // With NO LuckFox attached the floating/pulled-up lines can make
+      // spi_slave_transmit() "complete" back-to-back without any real
+      // master -- measured ~20,000 phantom 4000-byte DMA transactions per
+      // second, which saturated the CPU/DMA and flooded the console (that
+      // starves WiFi/ESP-NOW timing on the same chip). So: after a run of
+      // 100 non-header transactions, pause 5 ms between them (a real sender
+      // clocking a header is still caught -- the queued transaction is
+      // already armed when the delay ends, and the sender retries whole
+      // frames), and report on a timer instead of per count.
+      diagCount++;
+      noSyncRun++;
+      int64_t nowUs = esp_timer_get_time();
+      if (nowUs - lastDiagUs >= 10 * 1000 * 1000) {
+        ESP_LOGI(kTag, "no LuckFox traffic: %u transactions without a header in the last ~10 s (first bytes %02x %02x %02x %02x)",
+                 (unsigned)diagCount, g_rxScratch[0], g_rxScratch[1], g_rxScratch[2], g_rxScratch[3]);
+        lastDiagUs = nowUs;
+        diagCount = 0;
+      }
+      if (noSyncRun > 100) {
+        vTaskDelay(pdMS_TO_TICKS(5));
       }
     }
 

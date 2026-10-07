@@ -18,7 +18,7 @@ void printBanner(uint8_t storedId, uint8_t storedChainSize) {
   printf("\n=== ESP32-S3-RAP: node not provisioned ===\n");
   printf("Current NVS values: node_id=%u chain_size=%u\n", storedId, storedChainSize);
   printf("Send:  SETID <node_id> <chain_size>\n");
-  printf("  node_id 0   = this node is the Gateway (ENC28J60/RJ45)\n");
+  printf("  node_id 0   = this node is the Gateway (W5500/RJ45)\n");
   printf("  node_id 1..chain_size-1 = relay node\n");
   printf("Example, node 2 of a 5-node chain:  SETID 2 5\n");
   printf("Device restarts automatically once a valid line is received.\n");

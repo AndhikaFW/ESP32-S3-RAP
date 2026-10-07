@@ -26,4 +26,9 @@ void loop();
 // tick, not worth a lock for that).
 void setLaneStatus(uint8_t stream_id, uint8_t occupied, const char *plate);
 
+// One-line health summary: state, neighbors known, packets originated /
+// accepted / forwarded / retransmitted / dropped, out-queue depth. Call it
+// periodically from the main loop (see main.cpp).
+void logStats();
+
 }  // namespace chain_node

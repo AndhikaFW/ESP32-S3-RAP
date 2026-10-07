@@ -7,7 +7,7 @@ digraph ChainTopology {
     node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=13, margin="0.18,0.12"];
     edge [fontname="Helvetica", fontsize=11];
 
-    N0   [label="Node 0\nGATEWAY\nESP32-S3 + ENC28J60\n(no \"next\" -- sink only)", fillcolor="#2b6cb0", fontcolor="white", penwidth=2, color="#1a365d"];
+    N0   [label="Node 0\nGATEWAY\nESP32-S3 + W5500\n(no \"next\" -- sink only)", fillcolor="#2b6cb0", fontcolor="white", penwidth=2, color="#1a365d"];
     N1   [label="Node 1\nRELAY\n(originates own reading)", fillcolor="#2f855a", fontcolor="white"];
     N2   [label="Node 2\nRELAY\n(originates own reading)", fillcolor="#2f855a", fontcolor="white"];
     DOTS [label="...", shape=plaintext, fillcolor="white", fontsize=20, fontcolor="#4a5568"];
@@ -28,7 +28,7 @@ digraph ChainTopology {
     N0 -> N1 [label="HELLO only\n(discovery, no DATA)", color="#a0aec0", fontcolor="#718096", style=dotted, constraint=false];
 
     ETH [label="RPi4 Backend\nstatus+plate :5000\nvideo :5300", shape=cylinder, style=filled, fillcolor="#edf2f7", color="#4a5568", fontsize=12];
-    N0 -> ETH [label="RJ45 (Ethernet, ENC28J60)", color="#c05621", fontcolor="#c05621", penwidth=2.4, style=bold];
+    N0 -> ETH [label="RJ45 (Ethernet, W5500)", color="#c05621", fontcolor="#c05621", penwidth=2.4, style=bold];
 
     labelloc="t";
     label="Chain Network ESP32-S3 (ESP-NOW) -- every node originates its own reading, Gateway has no \"next\" and only sinks to Ethernet";

@@ -13,7 +13,7 @@ chain (all internal naming, e.g. `chain_node.*`, `chain_size`, was updated
 to match), kept only as the repo/project name for continuity.
 
 One node in the chain (`node_id == 0`, the **Gateway**) additionally carries
-an ENC28J60 module and bridges the chain to a wired LAN over RJ45 to a
+a W5500 module and bridges the chain to a wired LAN over RJ45 to a
 Raspberry Pi 4 backend -- it is still a parking-lot node like any other
 (same firmware, same LuckFox pairing), just the one that also has this extra
 uplink role. Every node runs the exact same firmware image; role and chain
@@ -43,7 +43,7 @@ idf.py -p PORT flash
 idf.py -p PORT monitor
 ```
 
-The `espressif/enc28j60` component is pulled automatically by the IDF
+The `espressif/w5500` component is pulled automatically by the IDF
 Component Manager on first build (declared in `main/idf_component.yml`).
 
 ### Building for a board without working PSRAM
@@ -110,5 +110,5 @@ listener scripts live in the parent repo's `backend/` folder, not in here
 - `main/provisioning.*` -- NVS identity + console provisioning prompt.
 - `main/chain_node.*` -- discovery + chain state machine (every node originates its own `StatusPacket` and relays what it receives from `prev`; Gateway only sinks).
 - `main/video_relay.*` -- separate WiFi AP+STA daisy-chain + TCP for bulk video (3 streams per node), independent of ESP-NOW.
-- `main/gateway_uplink.*` -- ENC28J60 bring-up (via `espressif/enc28j60`) and both backend uplinks (status/plate + video, Gateway only).
+- `main/gateway_uplink.*` -- W5500 bring-up (via `espressif/w5500`) and both backend uplinks (status/plate + video, Gateway only).
 - `main/main.cpp` -- `app_main`, wires the above together.

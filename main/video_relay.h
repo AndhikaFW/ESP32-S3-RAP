@@ -25,4 +25,7 @@ namespace video_relay {
 
 void init(uint8_t nodeId, uint8_t chainSize, bool isGateway);
 
+// One-line health summary of both video hops (see kStatsLogIntervalMs).
+void logStats();
+
 }  // namespace video_relay

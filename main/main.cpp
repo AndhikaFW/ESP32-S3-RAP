@@ -1,7 +1,10 @@
 #include "esp_event.h"
+#include "esp_system.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi_default.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 
 #include "freertos/FreeRTOS.h"
@@ -70,8 +73,23 @@ extern "C" void app_main(void) {
   video_relay::init(identity.node_id, identity.chain_size, identity.node_id == kGatewayNodeId);
   ESP_LOGI(kTag, "checkpoint: after video_relay::init");
 
+  const bool isGateway = identity.node_id == kGatewayNodeId;
+  uint32_t lastStatsMs = 0;
   while (true) {
     chain_node::loop();
+
+    uint32_t now = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+    if (now - lastStatsMs >= kStatsLogIntervalMs) {
+      lastStatsMs = now;
+      chain_node::logStats();
+      video_relay::logStats();
+      if (isGateway) {
+        gateway_uplink::logStats();
+      }
+      ESP_LOGI(kTag, "stats: heap free=%u min=%u KB, psram free=%u KB, uptime=%us",
+               (unsigned)(esp_get_free_heap_size() / 1024), (unsigned)(esp_get_minimum_free_heap_size() / 1024),
+               (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024), (unsigned)(now / 1000));
+    }
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }

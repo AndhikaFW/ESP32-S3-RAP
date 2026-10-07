@@ -1,4 +1,4 @@
 dependencies:
-  espressif/enc28j60: "^1.1.0"
+  espressif/w5500: "^2.0.0"
   idf:
     version: ">=5.0"

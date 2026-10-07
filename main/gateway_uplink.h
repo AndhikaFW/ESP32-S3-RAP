@@ -2,24 +2,30 @@
 
 #include <cstdint>
 
-// ENC28J60 (SPI Ethernet -> RJ45) side of the Gateway node. Only ever used
+// W5500 (SPI Ethernet -> RJ45) side of the Gateway node. Only ever used
 // on the node whose provisioned id == kGatewayNodeId; relay nodes never
 // touch this module.
 namespace gateway_uplink {
 
-// Brings up the SPI bus, ENC28J60 MAC/PHY, and esp_netif with a static IP
+// Brings up the SPI bus, W5500 MAC/PHY, and esp_netif with a static IP
 // (see config.h kEthStatic*). Assumes esp_netif_init()/
 // esp_event_loop_create_default() already ran. Returns false if the
 // Ethernet driver could not be installed/started; the chain still runs,
 // readings just fail to flush until the link recovers.
 bool init();
 
-// Sends one lane's reading to the backend server over a plain TCP socket.
-// Called once per StatusPacket the Gateway originates or receives (see
-// chain_node.cpp) -- there's no more "one flush per lap", each reading goes
-// out as soon as it arrives. Safe to call even if the link isn't up yet (it
-// will just fail fast and log).
+// Hands one lane's reading to the uplink task, which sends it to the backend
+// server over a plain TCP socket. Called once per StatusPacket the Gateway
+// originates or receives (see chain_node.cpp) -- there's no more "one flush
+// per lap", each reading goes out as soon as it arrives. NEVER blocks: it
+// only enqueues (the chain's main loop calls this, so a slow or dead
+// Ethernet side must not be able to stall ESP-NOW processing). If the queue
+// is full, or the link is down when the task gets to it, the reading is
+// dropped and counted -- see logStats().
 void flush(uint8_t nodeId, uint8_t streamId, uint8_t occupied, const char *plate);
+
+// One-line uplink health summary (link state, status/video sent/dropped).
+void logStats();
 
 // Queues one video frame -- already tagged by video_relay.cpp with which
 // node/stream/sequence it is -- for delivery to the backend over a second
