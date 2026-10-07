@@ -19,6 +19,7 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -45,6 +46,14 @@ volatile bool g_linkUp = false;
 std::atomic<uint32_t> g_ethRxFrames{0};
 std::atomic<uint32_t> g_ethRxArpReq{0};
 std::atomic<uint32_t> g_ethRxIpv4{0};
+
+// Uplink watchdog state, only touched from logStats() (main loop task).
+constexpr uint32_t kEthStuckIntervals = 6;                 // x kStatsLogIntervalMs (10 s) = 60 s
+constexpr uint32_t kEthRestartMinIntervalMs = 5 * 60 * 1000;
+uint32_t g_stuckIntervals = 0;
+uint32_t g_lastSentTotal = 0;
+uint32_t g_lastQueuedTotal = 0;
+uint32_t g_lastRestartMs = 0;
 
 // Replaces the netif glue's own input path (esp_eth_netif_glue.c just calls
 // esp_netif_receive()), counting frames before handing them on unchanged.
@@ -437,6 +446,45 @@ void logStats() {
            (unsigned)g_vidQueued, (unsigned)g_vidSent, (unsigned)g_vidDropped);
   ESP_LOGI(kTag, "stats: eth rx frames=%u arp_req=%u ipv4=%u", (unsigned)g_ethRxFrames, (unsigned)g_ethRxArpReq,
            (unsigned)g_ethRxIpv4);
+
+  if (g_ethHandle == nullptr || !g_linkUp) {
+    g_stuckIntervals = 0;
+    return;
+  }
+  eth_speed_t speed = ETH_SPEED_10M;
+  eth_duplex_t duplex = ETH_DUPLEX_HALF;
+  esp_eth_ioctl(g_ethHandle, ETH_CMD_G_SPEED, &speed);
+  esp_eth_ioctl(g_ethHandle, ETH_CMD_G_DUPLEX_MODE, &duplex);
+  ESP_LOGI(kTag, "stats: eth phy speed=%s duplex=%s", speed == ETH_SPEED_100M ? "100M" : "10M",
+           duplex == ETH_DUPLEX_FULL ? "full" : "half");
+
+  // Recovery for the "link is up and frames still arrive, but nothing we send
+  // reaches the peer" state seen on real hardware after the RPi's eth0 link
+  // flapped: uplink sends stopped succeeding while items kept being queued.
+  // Restarting the driver (MAC/PHY re-init) is a cheap attempt to clear it;
+  // limited to one per kEthRestartMinIntervalMs so a RPi with no listener
+  // (sends also "fail" then) doesn't cause the link to bounce constantly.
+  uint32_t sentTotal = g_stSent + g_vidSent;
+  uint32_t queuedTotal = g_stQueued + g_vidQueued;
+  if (queuedTotal != g_lastQueuedTotal && sentTotal == g_lastSentTotal) {
+    g_stuckIntervals++;
+  } else {
+    g_stuckIntervals = 0;
+  }
+  g_lastSentTotal = sentTotal;
+  g_lastQueuedTotal = queuedTotal;
+
+  uint32_t nowMs = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+  if (g_stuckIntervals >= kEthStuckIntervals &&
+      (g_lastRestartMs == 0 || nowMs - g_lastRestartMs >= kEthRestartMinIntervalMs)) {
+    ESP_LOGW(kTag, "uplink sends have not succeeded for %u stats intervals while link is up -- restarting Ethernet driver",
+             (unsigned)g_stuckIntervals);
+    g_lastRestartMs = nowMs;
+    g_stuckIntervals = 0;
+    esp_eth_stop(g_ethHandle);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    esp_eth_start(g_ethHandle);
+  }
 }
 
 void flushVideo(uint8_t originNodeId, uint8_t streamId, uint16_t seq, uint8_t *data, uint32_t dataLen) {
