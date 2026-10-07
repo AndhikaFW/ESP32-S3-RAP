@@ -38,6 +38,29 @@ esp_eth_handle_t g_ethHandle = nullptr;
 esp_netif_t *g_netif = nullptr;
 volatile bool g_linkUp = false;
 
+// W5500 receive-side counters, fed by ethRxHook() below. They exist to tell
+// "the W5500 never receives anything" apart from "it receives the RPi's ARP
+// requests/pings but nothing it sends back is accepted" when the uplink is
+// dead (see logStats()).
+std::atomic<uint32_t> g_ethRxFrames{0};
+std::atomic<uint32_t> g_ethRxArpReq{0};
+std::atomic<uint32_t> g_ethRxIpv4{0};
+
+// Replaces the netif glue's own input path (esp_eth_netif_glue.c just calls
+// esp_netif_receive()), counting frames before handing them on unchanged.
+esp_err_t ethRxHook(esp_eth_handle_t /*hdl*/, uint8_t *buffer, uint32_t length, void *priv, void * /*info*/) {
+  g_ethRxFrames++;
+  if (length >= 22) {
+    uint16_t etherType = static_cast<uint16_t>((buffer[12] << 8) | buffer[13]);
+    if (etherType == 0x0806 && buffer[20] == 0x00 && buffer[21] == 0x01) {
+      g_ethRxArpReq++;
+    } else if (etherType == 0x0800) {
+      g_ethRxIpv4++;
+    }
+  }
+  return esp_netif_receive(static_cast<esp_netif_t *>(priv), buffer, length, nullptr);
+}
+
 // One StatusPacket's worth of data queued for the status uplink task (see
 // statusUplinkTask()). The chain's main loop only ever enqueues; all the
 // slow/blocking socket work happens on that task.
@@ -370,6 +393,7 @@ bool init() {
     ESP_LOGE(kTag, "esp_netif_attach failed");
     return false;
   }
+  esp_eth_update_input_path_info(g_ethHandle, ethRxHook, g_netif);
 
   // Static IP: this is a direct cable to RPi4's eth0, no DHCP server on the
   // link (see config.h kEthStatic*). ESP_NETIF_DEFAULT_ETH() starts with a
@@ -411,6 +435,8 @@ void logStats() {
   ESP_LOGI(kTag, "stats: link=%s | status queued=%u sent=%u dropped=%u | video queued=%u sent=%u dropped=%u",
            g_linkUp ? "up" : "DOWN", (unsigned)g_stQueued, (unsigned)g_stSent, (unsigned)g_stDropped,
            (unsigned)g_vidQueued, (unsigned)g_vidSent, (unsigned)g_vidDropped);
+  ESP_LOGI(kTag, "stats: eth rx frames=%u arp_req=%u ipv4=%u", (unsigned)g_ethRxFrames, (unsigned)g_ethRxArpReq,
+           (unsigned)g_ethRxIpv4);
 }
 
 void flushVideo(uint8_t originNodeId, uint8_t streamId, uint16_t seq, uint8_t *data, uint32_t dataLen) {
